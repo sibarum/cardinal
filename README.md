@@ -286,36 +286,169 @@ row shape and are therefore filtered, sorted and projected by identical
 expressions, with a test asserting their columns match. SQL, LDAP and XML are the
 same claim with larger backends behind it.
 
-### JSON owns two of the three brackets
+### The notation is not a JSON superset
 
-Cardinal's value syntax must stay JSON-compatible, in this precise sense:
+An earlier draft of this document held that Cardinal's value syntax had to stay
+JSON-compatible, in the precise sense that **any JSON document is already a
+Cardinal expression**, and derived a syntax budget from it: `{}` and `[]` spoken
+for, `()` and the operator forms left. That is withdrawn. The notation is its
+own — **YADTON, Yet Another Dependently Typed Object Notation** — and the
+relation to JSON is a codec, not an inheritance.
 
-> **Any JSON document is already a Cardinal expression.**
+Two reasons, one measured and one structural.
 
-Records are written `{"name": value}` with the key quoted, lists are `[a, b]`,
-and the punctuation is JSON's punctuation. Cardinal's own written form is JSON
-*plus* the literals JSON lacks — sizes, moments, spans, typed text — each sitting
-in value position, where JSON would have a number or a string. They extend the
-grammar; they do not collide with it.
+The measured one is that the claim was never true of the parser the fork
+inherited, and nothing in the tree was checking it. Against `CardinalParser`
+today, in value position:
 
-The relation runs one way only. A Cardinal document that uses those extra
-literals is not a JSON document, and no amount of care makes it one. That price
-is paid once per construct added, which is the real budget: not punctuation, but
-how much of the written form stays inside JSON's grammar. It is why type
-information belongs in a header — a header of annotated strings keeps a whole
-document JSON-parseable, while an inline `4mb` does not.
+| written | today |
+| --- | --- |
+| `{a = 1}`, `Point{a = 1}` | a record — bare key, `=`, not `:` |
+| `"hello"`, `true`, `3.14` | as expected |
+| `[1, 2, 3]` | **rejected** — no list literal exists |
+| `{"a": 1}` | **rejected** — a quoted key is not a key |
+| `null` | parses as a *variable reference*, not a literal |
+| `-1` | parses as a subtraction, not a negative literal |
 
-The consequence for syntax is not a matter of taste:
+No JSON document above the scalars parses. The sizes, moments, spans and typed
+text the old section described as "JSON plus the literals JSON lacks" do not
+exist either: the lexer knows `INTEGER`, `DECIMAL`, `CHAR`, `STRING`, `REGEX`
+and `IDENT`, and nothing else. A constraint that lives only in prose stops being
+true quietly, and this one had.
 
-- `{}` and `[]` are **spoken for** in value position.
-- `()` is **available** — JSON has no parentheses at all.
-- Postfix and infix forms are **available** — JSON has no operators.
+The structural reason is the better one. **JSON has no types, so it cannot be
+the substrate for a notation whose types depend on values.** `[Int:@>0]` has no
+JSON spelling, and neither does any refinement, which is the whole point of
+carrying the notary into the fork. A JSON superset would have confined every
+dependent construct to a header of annotated strings — the old section said so
+itself, and treated it as a cost worth paying. It is not: it puts the
+interesting half of the notation outside the grammar and inside a convention.
 
-Types live in type position and values live in value position, and a
-recursive-descent parser always knows which it is reading. `{"a": [1, 2]}` is
-unambiguously value context; a refinement after a declaration's `:` is
-unambiguously type context. That coexistence is the first thing the parser fork
-has to demonstrate rather than assume.
+What this frees is the bracket budget. All three of `{}`, `[]` and `()` are
+Cardinal's to assign, and the assignment is made on what reads well rather than
+on what JSON left over. The rule that survives intact is the one that made the
+old argument work in the first place, and it is load-bearing for everything
+below: **types live in type position, values live in value position, and a
+recursive-descent parser always knows which it is reading.** `[` after a
+declaration's `:` opens a refinement; `[` in value position is free.
+
+What it costs is interop, and the cost should be stated rather than absorbed. A
+YADTON document is not a JSON document. Reading and writing JSON is therefore an
+**encoding** — one member of the family below, lossy in the direction that
+matters, since a refinement cannot survive the trip. That is a fair trade for a
+notation, and a bad one for a grammar.
+
+## Profiles: one grammar, four root vocabularies
+
+The same notation writes the data and the schema. That is the point and it is
+also the confusion: read a snippet and you cannot tell which you are holding,
+and a parser that accepts everything accepts a `spawn` in the middle of an API
+descriptor.
+
+The resolution is not four parsers. It is one grammar with a **profile** — a
+declared set of root-level constructs. Everything below the root is shared, so
+a struct member, a refinement and a string literal mean one thing everywhere;
+only the question "what may appear at the top?" has different answers.
+
+The root vocabulary today is fourteen constructs — `requires`, `exports`,
+`function`, `method`, `struct`, `trait`, `let`, `cast`, `assign`, `proof`,
+`action`, `conduit`, `conductor`, `spawn` — plus the `module` header. Four
+profiles carve it up:
+
+| profile | root vocabulary | shape |
+| --- | --- | --- |
+| **data** | none | exactly one literal, no preamble |
+| **schema** | `requires`, `struct`, `trait`, `let`(type alias), one `exports` | a set of declarations |
+| **query** | none | one well-formed refinement, outer `[]` optional |
+| **procedure** | `function` with a `Dispatch` signature | keyed computation |
+
+Notes on each, because the boundaries are where the meaning is.
+
+**Data has no preamble at all.** Not a `module` line, not a `requires`. A
+message is a value; anything else in the document is either schema or framing,
+and both belong to the encoding rather than to the text.
+
+**Schema's `let` is the type-level one.** `let Name:Type[…]` declares a sort
+alias and lowers to a `TypeAlias`; `let x = expr` binds a value and lowers to a
+`FunctionDecl`. The profile admits the first spelling and refuses the second,
+which is a distinction the parser already draws internally and has never had to
+name.
+
+**Query is a type, not an expression.** A filter is a refinement, and the rows
+that satisfy it are its inhabitants — so `parseSort` restricted to refinements
+*is* the query parser, with the outer brackets optional because at the root
+there is nothing to disambiguate from. This is the single most useful
+consequence of the profile split: it means the query language costs nothing to
+build, being the type grammar under a different name, and that a query is
+type-checked by the same code that checks a declaration.
+
+**`Dispatch` is a sort, not a keyword.** `IrSort.CallSig.DISPATCH` is the
+builtin head type for a keyed contract — keys in, value out. A stored
+procedure, a join, an aggregation and a map-reduce are all that shape, which is
+why the procedure profile is defined by the signature rather than by a new
+declarator. Nothing needs adding to the grammar for it.
+
+And the fifth profile is the one that exists: **program**, everything, which is
+what the parser does today and what `CardinalContext` compiles.
+
+### A typed shell, apparently
+
+The four profiles were not designed as a set; they were read off what the work
+demanded, and they turn out to be exactly what a typed shell needs — records
+flowing through a pipe, a declaration of what a command emits, a filter, and a
+stage that aggregates. MainFrame is a shell. That is a reason to believe the set
+is close to complete rather than arbitrary, and it makes one gap conspicuous:
+there is no profile for **composition**, the thing a pipe does. Whether that is
+a fifth profile, or the procedure profile seen from the other end, is open.
+
+## Encodings
+
+A profile says which constructs are legal. It says nothing about how the
+document is written down, and conflating the two is what made this hard to
+think about. They are separate axes:
+
+> A message is a **profile**, an **encoding**, and that encoding's **options**.
+
+The encodings are a family classified by compression and readability:
+
+- **portable** — the notation itself, read by the parser and written by the
+  printer. Human-readable, diffable, the reference the others are checked
+  against.
+- **binary** — byte offsets against a layout, carrying a version number so a
+  layout change is detectable rather than silently misread.
+- **JSON** — the interop codec, lossy where refinements are concerned, as above.
+
+Options are per-encoding and independent of the profile: schema in band or out,
+column headers present or absent, records as objects or as parallel arrays,
+temporal format, charset.
+
+Two consequences worth writing down, because both remove work.
+
+**"Include the schema in the data" is not a special case.** A schema is a set of
+declarations, which is an IR fragment, which is a value one level up. Including
+it means prepending a schema-profile document in the same encoding. That is the
+isomorphism doing work rather than a toggle needing its own machinery.
+
+**The binary encoding needs no parser.** It decodes to the same IR the text
+parser produces, so it is a codec against a data structure, not a second
+grammar. Only the portable encoding has a grammar, which is why there is one
+parser and not two.
+
+### The law
+
+For a fixed profile, and every encoding in the family:
+
+> **`read(write(x, e), e) == x`**
+
+That is a matrix, not a slogan: profiles down one side, encodings across the
+other, each cell a test. Round-tripping is the only claim that makes a family of
+formats a family rather than a pile, and it is checkable the same way the
+isomorphism is — write it, read it, compare.
+
+`IrSourcePrinter` is already the portable writer's honest half: a faithful
+declaration unparse, distinguished in its own documentation from
+`IrSourceReflector`, which is explicitly not guaranteed to round-trip. What is
+missing is a value printer, the round-trip tests, and the option surface.
 
 ## Runners
 
@@ -452,12 +585,26 @@ transfer. Keep it, move it, or accept the collision — but deliberately.
 values, which is a list-valued cell. Mongo documents nest, which records do
 natively. Neither needs anything new.
 
+**The value grammar has holes the notation cannot ship with.** There is no list
+literal, `null` reads as a variable, `-1` reads as a subtraction, and `[Int]` in
+type position silently parses as plain `Int` with the brackets absorbed — which
+will read as "list of Int" to everyone who meets it. These are not seams in the
+design sense, they are the first items of work, but the last one is a decision:
+`[T]` either means something or is an error, and quietly meaning `T` is the one
+option that is not available.
+
+**Composition has no profile.** Four profiles cover data, schema, query and
+procedure; a pipe composes them and is none of them. Either it is a fifth, or
+it is the procedure profile read from the other end.
+
 ## How this document is enforced
 
-Constraints that only live in prose stop being true quietly. The precedent worth
-copying is MainFrame's `JsonSubsetTest`, which reads every shape JSON can take
-through two different readers and asserts they agree — turning "JSON is a subset"
-from an intention into something that fails the build.
+Constraints that only live in prose stop being true quietly. This document has
+already lost one that way — the JSON-superset claim above was false of the
+parser for as long as it was written down, because nothing ran. The precedent
+worth copying is MainFrame's `JsonSubsetTest`, which reads every shape a format
+can take through two different readers and asserts they agree, turning an
+intention into something that fails the build.
 
 Mechanically checkable, and therefore owed a test:
 
@@ -466,8 +613,12 @@ Mechanically checkable, and therefore owed a test:
   notary reaches the same verdict on both. This is the load-bearing one — it is
   what licenses a consumer to trust a received descriptor as much as a locally
   compiled one.
-- any JSON document parses as Cardinal source, to the same value and the same type
-- the written form of a value reads back as that identical value
+- **the round-trip matrix**: for every profile and every encoding in the family,
+  a message written and read back is the message that went in. The portable
+  encoding is the reference the other cells are checked against.
+- a profile admits exactly the root constructs its row of the table names, and
+  every root construct the parser accepts is classified by some profile — so a
+  construct added upstream cannot go unclassified
 - a runner's declared pushdown capability matches what it actually evaluates
 
 Already checked, by something that runs:
@@ -487,7 +638,8 @@ Judgement, and therefore owed a decision recorded here:
 - where the interface surface ends and the IR's private business begins
 - the XML node mapping
 - whether `@` stays
-- which of Pontif's type-level syntax survives contact with JSON's brackets
+- what `[T]` means in type position, since it currently means `T`
+- whether composition is a fifth profile
 
 ## Where MainFrame fits
 
@@ -503,6 +655,13 @@ declares the row shape and the filesystem vocabulary, registered on a context.
 Its index-versus-disk-walk choice is exactly the `Capability` distinction, and
 it is the case that will show whether the declaration is shaped right before
 anything tries to prove things about it.
+
+What MainFrame needs from Cardinal is types, type refinements, pattern matching
+and type inference — and reading that list against the profile table is what
+turned the shell observation up. Its command signatures are the schema profile,
+its filters are the query profile, its rows are the data profile, and its
+aggregations are the procedure profile. It is not a consumer of Cardinal that
+happens to be a shell; it is the shell whose shape the profiles were read off.
 
 ## Licence
 
