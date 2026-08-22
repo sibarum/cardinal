@@ -1,0 +1,108 @@
+IrMatchTest runs every case through both the IR interpreter and the Truffle
+lowering and asserts the two agree. Cardinal has no Truffle arm, so this
+removes it -- the helpers, the truffle_* tests, and the section headings
+they left behind -- and keeps the interpreter half rather than deleting the
+file and losing the coverage with it.
+
+diff --git a/pontif-ir/src/test/java/sibarum/pontif/ir/IrMatchTest.java b/pontif-ir/src/test/java/sibarum/pontif/ir/IrMatchTest.java
+index fcc0dae..b90c4da 100644
+--- a/pontif-ir/src/test/java/sibarum/pontif/ir/IrMatchTest.java
++++ b/pontif-ir/src/test/java/sibarum/pontif/ir/IrMatchTest.java
+@@ -30,14 +30,6 @@ class IrMatchTest {
+         return new IrInterpreter(simp).eval(compiled);
+     }
+ 
+-    private static Object runTruffle(IrModule module) throws Exception {
+-        Simplifier simp = simplifier();
+-        IrCompiler compiler = new IrCompiler(simp);
+-        CompiledModule compiled = compiler.compile(module);
+-        TruffleProgram program = new TruffleLowering(compiler).lower(compiled);
+-        return program.run();
+-    }
+-
+     /**
+      * Builds a {@link CompiledModule} by hand, skipping the compile pipeline
+      * (and so the SortChecker totality gate). The runtime no-match safety net
+@@ -64,11 +56,6 @@ class IrMatchTest {
+         return new IrInterpreter(simplifier()).eval(compileUnchecked(module));
+     }
+ 
+-    private static Object runUncheckedTruffle(IrModule module) throws Exception {
+-        Simplifier simp = simplifier();
+-        return new TruffleLowering(new IrCompiler(simp)).lower(compileUnchecked(module)).run();
+-    }
+-
+     // --- Pattern sorts reused across tests ---
+ 
+     private static IrSort positive() {
+@@ -126,42 +113,6 @@ class IrMatchTest {
+         assertEquals(1L, runInterpreter(module));
+     }
+ 
+-    // --- Truffle lowering path: same behaviour ---
+-
+-    @Test
+-    void truffle_positiveLiteral_selectsPositiveBranch() throws Exception {
+-        IrExpr match = IrExpr.match(IrExpr.lit(5), List.of(
+-                IrExpr.matchBranch(positive(), IrExpr.lit(42)),
+-                IrExpr.matchBranch(anyInt(), IrExpr.lit(-1))));
+-        IrModule module = new IrModule("m", List.of(), match);
+-        assertEquals(42L, runTruffle(module));
+-    }
+-
+-    @Test
+-    void truffle_zeroLiteral_selectsZeroBranchBetweenPositiveAndNegative() throws Exception {
+-        IrExpr match = IrExpr.match(IrExpr.lit(0), List.of(
+-                IrExpr.matchBranch(positive(), IrExpr.lit(1)),
+-                IrExpr.matchBranch(zero(), IrExpr.lit(42)),
+-                IrExpr.matchBranch(negative(), IrExpr.lit(-1))));
+-        IrModule module = new IrModule("m", List.of(), match);
+-        assertEquals(42L, runTruffle(module));
+-    }
+-
+-    @Test
+-    void truffle_branchResultEvaluatesInScopeOfSurroundingBindings() throws Exception {
+-        // let x = 6 in match x with | zero -> 0 | positive -> x + 1
+-        IrExpr match = IrExpr.match(IrExpr.var("x"), List.of(
+-                IrExpr.matchBranch(zero(), IrExpr.lit(0)),
+-                IrExpr.matchBranch(positive(),
+-                        IrExpr.binOp(IrExpr.Op.ADD, IrExpr.var("x"), IrExpr.lit(1))),
+-                // negative arm completes the cover (x is 6 → never taken); the
+-                // match must be total now that SortChecker enforces principle 8.
+-                IrExpr.matchBranch(negative(), IrExpr.lit(0))));
+-        IrExpr program = IrExpr.letIn("x", anyInt(), IrExpr.lit(6), match);
+-        IrModule module = new IrModule("m", List.of(), program);
+-        assertEquals(7L, runTruffle(module));
+-    }
+-
+     // --- Origin: no-match error carries the IrExpr.Match origin ---
+ 
+     @Test
+@@ -185,27 +136,6 @@ class IrMatchTest {
+                 "error should cite the offending value; got: " + ex.getMessage());
+     }
+ 
+-    @Test
+-    void truffle_noMatch_throwsWithMatchOriginInMessage() throws Exception {
+-        Origin matchSite = Origin.span("test.ptf", 17, 4, 19, 10);
+-        IrExpr match = new IrExpr.Match(IrExpr.lit(-3),
+-                List.of(IrExpr.matchBranch(positive(), IrExpr.lit(99))),
+-                matchSite);
+-        IrModule module = new IrModule("m", List.of(), match);
+-
+-        RuntimeCheckException ex = assertThrows(
+-                RuntimeCheckException.class,
+-                () -> runUncheckedTruffle(module));
+-
+-        assertEquals(matchSite, ex.origin());
+-        assertTrue(ex.getMessage().contains("test.ptf:17:4"),
+-                "error should include origin; got: " + ex.getMessage());
+-        assertTrue(ex.getMessage().contains("No match branch"),
+-                "error should explain the failure; got: " + ex.getMessage());
+-        assertTrue(ex.getMessage().contains("-3"),
+-                "error should cite the offending value; got: " + ex.getMessage());
+-    }
+-
+     // --- Origin: nested exception inside a branch result is re-tagged with the match origin
+     //     only when the inner exception had no origin of its own (so deeper origins win).
+ 

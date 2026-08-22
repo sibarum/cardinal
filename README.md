@@ -1,7 +1,7 @@
 # Cardinal
 
 A fork of [Pontif](https://github.com/sibarum/pontif-framework) that stops before
-the runtime.
+Truffle.
 
 Cardinal keeps the syntax, the type inference, the IR and the notary. It drops the
 Truffle execution layer. What is left is a front end that reads a typed,
@@ -34,7 +34,7 @@ identifiers and anything left over from lowering are not part of it. Defining th
 boundary precisely is a prerequisite, because it is what the isomorphism is an
 isomorphism *with*.
 
-## Why the execution layer comes off cleanly
+## Why Truffle comes off cleanly
 
 The strongest evidence is not a measurement: **Pontif already has two front ends
 over one IR.** `PontifParser` reads the surface language and `SexprParser` reads
@@ -62,21 +62,24 @@ runtime" therefore means, precisely: drop the AST lowering.
 
 And the coupling from the IR to it is two files, `TruffleLowering.java` and
 `TruffleProgram.java`, which *are* the lowering step. Delete them and the IR
-stands alone. The five in `core` are `Pontif`, `PontifLanguage`, `PontifNode`,
-`PontifRootNode` and `Resolver` — the first four are Truffle language
-registration and drop out with it; `Resolver` is the one that will argue back,
-since it appears to want frame slots for something the rest of the front end
-needs.
+stands alone. The five in `core` — `Pontif`, `PontifLanguage`, `PontifNode`,
+`PontifRootNode` and `Resolver` — all go. The first four are language
+registration and the tree-node base class. `Resolver` was expected to argue
+back, since it allocates frame slots and so looked like something the front end
+might want for scoping; it does not. Its only callers are the AST nodes, two of
+those four registration classes, and `TruffleLowering` — every one of them
+leaving.
+
+`PontifNode` takes two more with it: `core/types/Rule` and
+`core/types/RuleEngine`, a typing-rule dispatcher keyed on AST node classes.
+Nothing Cardinal keeps calls them; upstream, only `pontif-demo` does.
 
 **Taken:** `parser`, `ir`, `core`, `predicates`, `conservation`, `receipts`,
-`defaults` — 183 files, about 40,100 lines.
+`defaults` — 183 main files (~40,100 lines) plus 67 test files.
 **Dropped:** `ast` and `runtime` (64 files, ~6,400 lines), `gpu`, the builtin
 libraries, the CLI, the playground.
-**Stripped:** the two lowering files, and four of the five Truffle files in
-`core`.
-
-This plan rests on module-level dependency and import counts plus the
-two-front-ends arrangement, not on a read of the IR or the notary internals.
+**Stripped:** nine main files — the two lowering files and the seven above —
+and three Truffle-only test classes.
 
 > Measured against `pontif-framework`. There is a `pontif-framework-2` on the
 > same disk which is 138 commits behind and a month cold; an earlier draft of
@@ -86,19 +89,36 @@ two-front-ends arrangement, not on a read of the IR or the notary internals.
 ## What does not exist yet
 
 Nothing in `pontif-ir` serialises the IR. There is no descriptor module, no
-reader, no round-trip. The lowering to Truffle is the only thing that consumes
-the IR structurally.
+reader, no round-trip.
 
 So the isomorphism is the work, not a repackaging of something already present.
 That is worth knowing before starting: the fork is mechanical, and the actual
 build is the descriptor and its inverse.
+
+### It is Truffle that comes off, not execution
+
+The Truffle lowering is not, however, the only thing that consumes the IR
+structurally. `pontif-ir` also holds `IrInterpreter` — 2,308 lines that
+evaluate the IR directly, in plain Java, importing no Truffle at all. It came
+across with the module, so Cardinal has an execution engine whether or not the
+headline says so. "An artifact with no execution layer underneath it" was the
+wrong way to put it; **Truffle-free** is the accurate claim, and it is the one
+that matters, since Truffle is what would have had to be on a consumer's
+classpath.
+
+Two things make that fine rather than embarrassing. It is a leaf: in main
+source only `Closure` refers to it, so removing it later would be a deletion
+rather than a disentangling. And the runner design below already needs it —
+"local evaluation is always available, so pushdown is only ever an
+optimisation" is a claim about having a local evaluator, and this is the local
+evaluator. Keeping it is a choice, now a deliberate one.
 
 ## Coexistence
 
 Cardinal and Pontif must be able to sit in one runtime without conflicting. That
 assumption is load-bearing — a service that speaks descriptors while a Pontif
 program executes alongside it is the point — so it is worth stating what it
-actually requires. Checked against the live tree:
+actually requires. Read off the live tree:
 
 | what could collide | state upstream | what Cardinal must do |
 | --- | --- | --- |
@@ -112,15 +132,28 @@ Identical fully-qualified class names on one classpath is the hard conflict: the
 loader picks one and says nothing. The package rename is not cosmetic, it is the
 requirement.
 
-It is also safe to do mechanically. No file in any module Cardinal takes mentions
-its own package in a string literal, `ir` and `core` ship no resources, and the
-only service-loader entries register runtime extensions in modules that are being
+It is also safe to do mechanically. No file in any module Cardinal takes names
+its own Java package in a string literal, none of the seven ships a resource of
+any kind — they are `.java` and a `pom.xml` and nothing else — and the only
+service-loader entries register runtime extensions in modules that are being
 dropped. So the rename is a path-and-declaration transform with nothing hiding
 behind reflection.
+
+The word `pontif` does survive in string literals, but as the *language's* own
+module namespace rather than the Java one: `requires pontif.core.{Stream}` in
+an error message, a `pontif.events/StdOut` in a test. Those are Cardinal's
+namespace now and the same substitution is right for them, but it is a second
+thing being renamed, and it would not have been safe to assume so.
 
 And dropping the language registration is what makes coexistence *free* rather
 than negotiated. Cardinal registers no language, claims no id, and answers to no
 file extension. There is nothing for a polyglot context to arbitrate.
+
+None of that has to be taken on trust. `tools/coexist.sh` builds both projects,
+puts every jar from each on one classpath, and asserts the three things that
+would break: no class file name occurs in both, one loader resolves a parser
+from each project as distinct classes, and Cardinal contributes no language
+registration. It runs green over 24 jars and 1,030 classes.
 
 ### Keep the divergence a transform, not a pile of edits
 
@@ -128,13 +161,60 @@ The benefit worth protecting is being able to take upstream work when it suits
 and ignore it when it does not — and that decays fast if the fork becomes a set
 of hand edits nobody can replay.
 
-So define the fork as a function: **Cardinal = f(Pontif)**, where `f` is rename
-the packages, drop these modules, delete these six files. Keep `f` in the
-repository as a script. Then adopting an upstream change is `f` applied to a
-patch rather than a manual reconciliation, and the fork stays mergeable for as
-long as the transform stays accurate. When `f` stops applying cleanly, that is
-information — it means upstream moved something structural, and it is better to
-learn that from a failing script than from a silent merge.
+So the fork is a function: **Cardinal = f(Pontif)**, where `f` renames the
+packages, drops the modules, deletes the nine files and patches two more. `f`
+lives in the repository as [`tools/fork.sh`](tools/fork.sh). Adopting an
+upstream change is `f` applied to a patch rather than a manual reconciliation,
+and the fork stays mergeable for as long as the transform stays accurate. When
+`f` stops applying cleanly, that is information — it means upstream moved
+something structural, and it is better to learn that from a failing script than
+from a silent merge.
+
+Which is why `f` fails loudly rather than doing its best. Every file it expects
+to delete must be there, every patch must apply, `cardinal-ir` must still
+depend on the module being dropped and `cardinal-core` on `truffle-api`, and
+the verification at the end is fatal. Each of those is a place where upstream
+could move something structural without the result looking wrong.
+
+## The fork, as run
+
+```
+tools/fork.sh ../pontif-framework
+```
+
+Against `pontif-framework` at `fbd3c89` (647 commits), `f` reports:
+
+```
+f: copied 7 modules
+f: stripped 12 files
+f: applied 2 patches
+f: wrote pom.xml, transformed 7 module poms
+f: ok -- 238 java files (174 main, 64 test), 51345 lines, no Truffle, no pontif
+```
+
+leaving `cardinal-core`, `-predicates`, `-defaults`, `-ir`, `-parser`,
+`-conservation` and `-receipts` under `sibarum.cardinal:cardinal`. Everything
+outside `tools/` is generated by `f`; edit the script, not the tree.
+[`tools/UPSTREAM`](tools/UPSTREAM) records the revision the tree came from, so
+"is the fork current?" has an answer rather than a guess.
+
+`mvn test` is green: **727 tests, no failures.** Upstream's seven modules carry
+779, and the 52 that did not come across are exactly the Truffle execution
+arms — three test classes deleted outright, and ten `truffle_*` methods removed
+by the two patches from `IrMatchTest` and `IrRecordTest`, which run every case
+through both engines and assert the two agree. Those two files are patched
+rather than deleted because deleting them to be rid of one arm would have cost
+twenty-nine test methods.
+
+Two things about the transform were only claims before it ran:
+
+- **The rename really is mechanical** — move `sibarum/pontif` to
+  `sibarum/cardinal`, rename the four surviving `Pontif*` classes and thirteen
+  test classes, substitute the text. No reflection, no resources, no service
+  loaders. It renames two things rather than one, though, per the caveat above.
+- **Line endings are not incidental.** Upstream's working tree mixes CRLF and
+  LF file by file, which would have made the patches fail for reasons with
+  nothing to do with the code. `f` normalises to LF before patching.
 
 ## Why a fork and not a module upstream
 
@@ -287,8 +367,15 @@ Mechanically checkable, and therefore owed a test:
   compiled one.
 - any JSON document parses as Cardinal source, to the same value and the same type
 - the written form of a value reads back as that identical value
-- no module outside the fork boundary imports Truffle
 - a runner's declared pushdown capability matches what it actually evaluates
+
+Already checked, by something that runs:
+
+- nothing Cardinal ships imports Truffle, and no `pontif` survives the
+  rename — `f` asserts both, fatally, on every run
+- Cardinal and Pontif coexist on one classpath — `tools/coexist.sh`
+- the front end still works after the transform — 727 tests, which is upstream's
+  whole suite for these modules bar the Truffle arms
 
 Judgement, and therefore owed a decision recorded here:
 

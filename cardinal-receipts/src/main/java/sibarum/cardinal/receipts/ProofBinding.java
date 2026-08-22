@@ -1,0 +1,150 @@
+package sibarum.cardinal.receipts;
+
+import sibarum.cardinal.core.symbolic.SymExpr;
+import sibarum.cardinal.ir.CompileException;
+import sibarum.cardinal.ir.IrModule;
+import sibarum.cardinal.ir.IrParam;
+import sibarum.cardinal.ir.IrStmt;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Binds in-source {@code proof f = …} declarations to the receipt-graph
+ * obligations they discharge, translating each struct-literal proof tree to a
+ * {@link Refinement} keyed by {@link GraphReference}.
+ *
+ * <p>Shared by the two consumers so they can never disagree about what a proof
+ * proves: the return-refinement gate ({@code CardinalCompiler}) — which turns any
+ * {@link Result#problems()} into a hard compile error — and the receipt-graph
+ * report ({@code ReceiptGraphReport}) — which renders proof-discharged branches
+ * and treats problems as best-effort skips.
+ *
+ * <p>Variable renaming matches the {@link Drafter}: a source parameter {@code x}
+ * is the graph variable {@code x_0}, so proof predicates authored over {@code x}
+ * align with the obligation's {@code PathFacts}.
+ *
+ * <p>v1 binds a proof only to a function that is the sole node of its name
+ * (no overloads) with a single branch (no {@code match}); anything else is a
+ * reported problem.
+ */
+public final class ProofBinding {
+
+    private ProofBinding() {}
+
+    /**
+     * @param proofs   valid proofs, keyed by the obligation they discharge
+     * @param problems human-readable issues (unknown/overloaded/orphaned/
+     *                 multi-branch target, duplicate proof, untranslatable tree),
+     *                 in source order; empty when every proof bound cleanly
+     */
+    public record Result(Map<GraphReference, Refinement> proofs, List<String> problems) {
+        public Result {
+            proofs = Map.copyOf(proofs);
+            problems = List.copyOf(problems);
+        }
+    }
+
+    /**
+     * Builds the proof map for {@code module} against its already-drafted
+     * {@code graph}. Never throws — translation failures become problems.
+     */
+    public static Result bind(IrModule module, ReceiptGraph graph) {
+        return bind(module, graph, java.util.Set.of());
+    }
+
+    /**
+     * As {@link #bind(IrModule, ReceiptGraph)}, but proof trees whose head
+     * constructor's local name is in {@code foreignHeads} are skipped entirely
+     * (no problem emitted) — they are propositions about a different ledger
+     * (e.g. conservation receipts), bound by that ledger's own binder. The one
+     * {@code proof} statement carries both vocabularies; the head picks the
+     * ledger.
+     */
+    public static Result bind(IrModule module, ReceiptGraph graph,
+            java.util.Set<String> foreignHeads) {
+        Map<String, IrStmt.Proof> proofDecls = new LinkedHashMap<>();
+        Map<String, IrStmt.FunctionDecl> fnDecls = new LinkedHashMap<>();
+        List<String> problems = new ArrayList<>();
+        for (IrStmt stmt : module.statements()) {
+            if (stmt instanceof IrStmt.Proof p) {
+                String head = headLocalName(p.proofTree());
+                if (head != null && foreignHeads.contains(head)) {
+                    continue;  // another ledger's proposition
+                }
+                if (proofDecls.put(p.functionName(), p) != null) {
+                    problems.add("Duplicate proof for '" + p.functionName()
+                            + "' — at most one proof per function.");
+                }
+            } else if (stmt instanceof IrStmt.FunctionDecl fd) {
+                fnDecls.putIfAbsent(fd.name(), fd);
+            }
+        }
+
+        // function name → node index/indices (one node per declaration).
+        Map<String, List<Integer>> nodeIdxByName = new HashMap<>();
+        for (int i = 0; i < graph.roots().size(); i++) {
+            nodeIdxByName.computeIfAbsent(graph.roots().get(i).functionName(),
+                    k -> new ArrayList<>()).add(i);
+        }
+
+        Map<GraphReference, Refinement> proofs = new HashMap<>();
+        for (Map.Entry<String, IrStmt.Proof> e : proofDecls.entrySet()) {
+            String fn = e.getKey();
+            List<Integer> idxs = nodeIdxByName.get(fn);
+            if (idxs == null || idxs.isEmpty()) {
+                problems.add("Proof references unknown function '" + fn + "'.");
+                continue;
+            }
+            if (idxs.size() > 1) {
+                problems.add("Proof for '" + fn + "' targets an overloaded function — "
+                        + "proofs on overloaded functions aren't supported yet.");
+                continue;
+            }
+            int nodeIdx = idxs.get(0);
+            Node node = graph.roots().get(nodeIdx);
+            if (!node.resultVar().sort().isRefined()) {
+                problems.add("Proof for '" + fn + "' is orphaned — '" + fn
+                        + "' has no refined return to prove; remove the proof.");
+                continue;
+            }
+            if (node.branches().size() != 1) {
+                problems.add("Proof for '" + fn + "' targets a multi-branch (match) "
+                        + "function — per-branch proofs aren't supported yet.");
+                continue;
+            }
+            Map<String, SymExpr> rename = new HashMap<>();
+            IrStmt.FunctionDecl fd = fnDecls.get(fn);
+            if (fd != null) {
+                for (IrParam p : fd.params()) {
+                    rename.put(p.name(), SymExpr.var(p.name() + "_0"));
+                }
+            }
+            try {
+                proofs.put(new GraphReference(nodeIdx, 0),
+                        RefinementProof.fromIr(e.getValue().proofTree(), rename));
+            } catch (CompileException ce) {
+                problems.add("Proof for '" + fn + "' could not be used: " + ce.getMessage());
+            }
+        }
+        return new Result(proofs, problems);
+    }
+
+    /**
+     * The proof tree's head constructor as a local name (FQN module prefix
+     * stripped) — a linked tree is a {@code Record} with an FQN'd type name;
+     * a bare-file tree may still be a {@code Call}. Null when headless.
+     */
+    private static String headLocalName(sibarum.cardinal.ir.IrExpr tree) {
+        String name = switch (tree) {
+            case sibarum.cardinal.ir.IrExpr.Record r -> r.typeName();
+            case sibarum.cardinal.ir.IrExpr.Call c -> c.functionName();
+            default -> null;
+        };
+        if (name == null) return null;
+        return sibarum.cardinal.core.QualifiedName.memberOf(name);
+    }
+}

@@ -1,0 +1,120 @@
+IrRecordTest runs every case through both the IR interpreter and the Truffle
+lowering and asserts the two agree. Cardinal has no Truffle arm, so this
+removes it -- the helpers, the truffle_* tests, and the section headings
+they left behind -- and keeps the interpreter half rather than deleting the
+file and losing the coverage with it.
+
+diff --git a/pontif-ir/src/test/java/sibarum/pontif/ir/IrRecordTest.java b/pontif-ir/src/test/java/sibarum/pontif/ir/IrRecordTest.java
+index 83dc111..65f3f78 100644
+--- a/pontif-ir/src/test/java/sibarum/pontif/ir/IrRecordTest.java
++++ b/pontif-ir/src/test/java/sibarum/pontif/ir/IrRecordTest.java
+@@ -33,14 +33,6 @@ class IrRecordTest {
+         return new IrInterpreter(simp).eval(compiled);
+     }
+ 
+-    private static Object runTruffle(IrModule module) throws Exception {
+-        Simplifier simp = simplifier();
+-        IrCompiler compiler = new IrCompiler(simp);
+-        CompiledModule compiled = compiler.compile(module);
+-        TruffleProgram program = new TruffleLowering(compiler).lower(compiled);
+-        return program.run();
+-    }
+-
+     private static Map<String, IrExpr> members(Object... kvPairs) {
+         if (kvPairs.length % 2 != 0) {
+             throw new IllegalArgumentException("members() requires alternating keys and values");
+@@ -164,94 +156,6 @@ class IrRecordTest {
+                 "error should say what was expected; got: " + ex.getMessage());
+     }
+ 
+-    // --- Both paths agree ---
+-
+-    @Test
+-    void truffle_buildAndAccessRecord_matchesInterpreter() throws Exception {
+-        IrExpr program = IrExpr.fieldAccess(
+-                IrExpr.record(members("a", IrExpr.lit(11), "b", IrExpr.lit(22))),
+-                "b");
+-        IrModule module = new IrModule("m", List.of(), program);
+-        assertEquals(22L, runTruffle(module));
+-        assertEquals(22L, runInterpreter(module));
+-    }
+-
+-    @Test
+-    void truffle_nestedRecordAndFieldAccess_matchesInterpreter() throws Exception {
+-        IrExpr program = IrExpr.fieldAccess(
+-                IrExpr.fieldAccess(
+-                        IrExpr.record(members(
+-                                "outer", IrExpr.record(members("inner", IrExpr.lit(99))))),
+-                        "outer"),
+-                "inner");
+-        IrModule module = new IrModule("m", List.of(), program);
+-        assertEquals(99L, runTruffle(module));
+-        assertEquals(99L, runInterpreter(module));
+-    }
+-
+-    @Test
+-    void truffle_missingFieldOnAnonymousRecord_isCompileError() throws Exception {
+-        // Same moved contract as the interpreter path: the field-safety gate runs
+-        // at compile time (IrCompiler.compile), so neither backend reaches a
+-        // runtime miss on a statically-shaped record.
+-        Origin accessSite = Origin.at("test.ptf", 8, 2);
+-        IrExpr program = new IrExpr.FieldAccess(
+-                IrExpr.record(members("x", IrExpr.lit(1))),
+-                "missing",
+-                accessSite);
+-        CompileException ex = assertThrows(
+-                CompileException.class,
+-                () -> runTruffle(new IrModule("m", List.of(), program)));
+-        assertEquals(accessSite, ex.origin());
+-        assertTrue(ex.getMessage().contains("has no field 'missing'"),
+-                "error should name the missing field; got: " + ex.getMessage());
+-    }
+-
+-    @Test
+-    void truffle_fieldAccessOnNonRecord_throwsWithOrigin() throws Exception {
+-        Origin accessSite = Origin.at("test.ptf", 9, 4);
+-        IrExpr program = new IrExpr.FieldAccess(IrExpr.lit(5), "x", accessSite);
+-        RuntimeCheckException ex = assertThrows(
+-                RuntimeCheckException.class,
+-                () -> runTruffle(new IrModule("m", List.of(), program)));
+-        assertEquals(accessSite, ex.origin());
+-        assertTrue(ex.getMessage().contains("test.ptf:9:4"),
+-                "error should include origin; got: " + ex.getMessage());
+-    }
+-
+-    // --- Records flow through let-bindings, lambdas, and match ---
+-
+-    @Test
+-    void truffle_recordPassedThroughLambda_andFieldAccessedAfter() throws Exception {
+-        // let p = {a: 100, b: 1} in (\r -> r.a + r.b)(p) = 101
+-        IrSort point = IrSort.structural("P", Map.of(
+-                "a", IrSort.named("Int"), "b", IrSort.named("Int")));
+-        IrExpr lambda = IrExpr.lambda(
+-                List.of(new IrParam("r", point)),
+-                IrSort.named("Int"),
+-                IrExpr.binOp(IrExpr.Op.ADD,
+-                        IrExpr.fieldAccess(IrExpr.var("r"), "a"),
+-                        IrExpr.fieldAccess(IrExpr.var("r"), "b")));
+-        IrExpr program = IrExpr.letIn("p", point,
+-                IrExpr.record(members("a", IrExpr.lit(100), "b", IrExpr.lit(1))),
+-                IrExpr.apply(lambda, List.of(IrExpr.var("p"))));
+-        assertEquals(101L, runTruffle(new IrModule("m", List.of(), program)));
+-    }
+-
+-    @Test
+-    void truffle_fieldAccessAsMatchScrutinee() throws Exception {
+-        // let p = {n: -3} in match p.n with | negative -> 42 | _ -> 0
+-        IrSort negative = IrSort.refined("Int",
+-                IrExpr.binOp(IrExpr.Op.LT, IrExpr.self(), IrExpr.lit(0)));
+-        IrExpr program = IrExpr.letIn("p",
+-                IrSort.structural("P", Map.of("n", IrSort.named("Int"))),
+-                IrExpr.record(members("n", IrExpr.lit(-3))),
+-                IrExpr.match(IrExpr.fieldAccess(IrExpr.var("p"), "n"), List.of(
+-                        IrExpr.matchBranch(negative, IrExpr.lit(42)),
+-                        IrExpr.matchBranch(IrSort.named("Int"), IrExpr.lit(0)))));
+-        assertEquals(42L, runTruffle(new IrModule("m", List.of(), program)));
+-    }
+-
+     // --- Lifting Record / FieldAccess into refinement predicates ---
+ 
+     @Test

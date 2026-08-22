@@ -1,0 +1,313 @@
+package sibarum.cardinal.core.symbolic;
+
+import sibarum.cardinal.core.QualifiedName;
+import sibarum.cardinal.core.types.Sort;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+public final class DispatchTable {
+
+    private final Map<String, List<FunctionDecl>> declarations = new HashMap<>();
+    private final TraitRegistry traitRegistry;
+
+    public DispatchTable() {
+        this(new TraitRegistry());
+    }
+
+    public DispatchTable(TraitRegistry traitRegistry) {
+        this.traitRegistry = traitRegistry;
+    }
+
+    public DispatchTable register(FunctionDecl decl) {
+        declarations.computeIfAbsent(decl.name(), k -> new ArrayList<>()).add(decl);
+        return this;
+    }
+
+    public TraitRegistry traitRegistry() {
+        return traitRegistry;
+    }
+
+    public List<FunctionDecl> declarationsFor(String name) {
+        return List.copyOf(declarations.getOrDefault(name, List.of()));
+    }
+
+    public DispatchResult resolve(String name, List<SymExpr> arguments, Simplifier simplifier) {
+        DispatchResult direct = resolveDirect(name, arguments, simplifier);
+        if (!(direct instanceof DispatchResult.NoMatch)) return direct;
+        // Trait-fallback: if the call name is `Trait.method` and the first
+        // argument's concrete type satisfies that trait, redirect to
+        // `<ConcreteType>.method`. Only fires when the direct lookup
+        // produced NoMatch — ambiguous resolutions stay as-is.
+        DispatchResult traitFallback = resolveTraitFallback(name, arguments, simplifier);
+        if (traitFallback != null) return traitFallback;
+        return direct;
+    }
+
+    /**
+     * "method" for a {@code Type.name}-keyed dispatch name (instance/static
+     * method mangling), "function" for a bare name. Module FQNs
+     * ({@code mod/Type.name}) are stripped before the check.
+     */
+    private static String declarationKind(String name) {
+        // The member (post-module) key: "Type.method" → method, a bare name or an
+        // operator symbol → function. QualifiedName handles the division overload
+        // (`module//` → member "/") that a lastIndexOf('/') split would mangle to "".
+        String member = QualifiedName.memberOf(name);
+        return member.indexOf('.') >= 0 ? "method" : "function";
+    }
+
+    private DispatchResult resolveDirect(String name, List<SymExpr> arguments, Simplifier simplifier) {
+        List<FunctionDecl> candidates = declarations.getOrDefault(name, List.of());
+        if (candidates.isEmpty()) {
+            return DispatchResult.noMatch(
+                    "No " + declarationKind(name) + " named '" + name + "' is declared");
+        }
+        // Working copy: see resolveTraitFallback's "compileCall + trait promotion" wrapper below.
+
+        record MatchingCandidate(FunctionDecl decl, CompiledCall call) {}
+        List<MatchingCandidate> matching = new ArrayList<>();
+        for (FunctionDecl c : candidates) {
+            if (c.parameters().size() != arguments.size()) continue;
+            CompiledCall call = FunctionCheck.compileCall(c, arguments, simplifier);
+            // Trait-typed param matching: bare-named sorts whose names are
+            // registered traits get strict satisfaction-checking, overriding
+            // Refinements.satisfies's default permissive Passed.
+            call = enforceTraitParams(call, c, arguments, simplifier);
+            // Struct-inheritance param matching: a `Sub` value satisfies an (unrefined) `Base`
+            // struct parameter (`Exp is-a BiOp`). Refinements can't see the nominal base chain,
+            // so a widen would otherwise be a StaticallyFailed — the runtime counterpart of the
+            // call gate's struct-base widen (StaticDispatch#isStructBaseWiden).
+            call = enforceStructBaseParams(call, c, arguments);
+            if (call.canExecute()) {
+                matching.add(new MatchingCandidate(c, call));
+            }
+        }
+
+        if (matching.isEmpty()) {
+            return DispatchResult.noMatch(
+                    "No matching " + declarationKind(name) + " '" + name + "' for the given arguments");
+        }
+
+        List<MatchingCandidate> mostSpecific = new ArrayList<>();
+        for (MatchingCandidate c : matching) {
+            boolean dominated = false;
+            for (MatchingCandidate other : matching) {
+                if (other == c) continue;
+                if (isStrictlyMoreSpecific(other.decl(), c.decl(), simplifier)) {
+                    dominated = true;
+                    break;
+                }
+            }
+            if (!dominated) {
+                mostSpecific.add(c);
+            }
+        }
+
+        if (mostSpecific.size() == 1) {
+            return DispatchResult.resolved(mostSpecific.get(0).decl(), mostSpecific.get(0).call());
+        }
+        return DispatchResult.ambiguous(mostSpecific.stream().map(MatchingCandidate::decl).toList());
+    }
+
+    /**
+     * Enforces trait satisfaction on trait-typed parameters. A bare-named
+     * sort is treated as a trait if the {@link TraitRegistry} has at least
+     * one registered satisfier for that name. For each such param:
+     * <ul>
+     *   <li>If the arg is a {@link SymExpr.Record} whose {@code typeName} is
+     *       a registered satisfier → outcome is {@code StaticallyPassed}.
+     *   <li>Otherwise (anonymous record, primitive, non-satisfying type) →
+     *       outcome is {@code StaticallyFailed}.
+     * </ul>
+     *
+     * <p>This overrides the default permissive behavior of
+     * {@link Refinements#satisfies} for bare-named sorts (which returns
+     * {@code Passed} unconditionally). Non-trait bare-named sorts keep the
+     * permissive behavior.
+     *
+     * <p>Caveat: a trait with no registered satisfiers is treated as a
+     * non-trait name here (the heuristic relies on satisfier set being
+     * non-empty). Acceptable in practice — a function taking a trait with
+     * no impls can't be called usefully anyway.
+     */
+    private CompiledCall enforceTraitParams(
+            CompiledCall call, FunctionDecl decl, List<SymExpr> arguments, Simplifier simplifier) {
+        List<CompiledCall.ParameterOutcome> updated = new ArrayList<>(call.outcomes().size());
+        boolean changed = false;
+        for (CompiledCall.ParameterOutcome outcome : call.outcomes()) {
+            int i = outcome.parameterIndex();
+            sibarum.cardinal.core.types.Sort paramSort = decl.parameters().get(i).sort();
+            if (!isTraitNameSort(paramSort)) {
+                updated.add(outcome);
+                continue;
+            }
+            SymExpr arg = arguments.get(i);
+            boolean satisfies = arg instanceof SymExpr.Record r
+                    && r.typeName() != null
+                    && traitRegistry.satisfies(paramSort.name(), r.typeName());
+            // A first-class metareference is a dispatch OBJECT with a concrete nominal
+            // (Dispatch / AlgebraicDispatch): it satisfies a trait param when that nominal
+            // is-a the trait — so `astOf(f:Algebraic)` accepts `$poly[Decimal]`.
+            if (!satisfies && arg instanceof SymExpr.DispatchRef dr && dr.typeName() != null) {
+                satisfies = traitRegistry.satisfies(paramSort.name(), dr.typeName());
+            }
+            // A positional tuple satisfies a Stream[T] parameter STRUCTURALLY — the §4
+            // autobox: a tuple IS a stream, with elements checked against T (§8.6,
+            // Refinements.satisfiesStreamElements). Nominal satisfiers cover the other
+            // traits; only Stream accepts a bare tuple this way (WAR(stream) call-site
+            // dispatch — a generic/concrete map can take a `(1,2,3)` argument).
+            if (!satisfies && isStreamName(paramSort.name())
+                    && arg instanceof SymExpr.Record rt && "_tuple".equals(rt.typeName())) {
+                satisfies = Refinements.satisfies(arg, paramSort, simplifier)
+                        instanceof sibarum.cardinal.core.symbolic.algebra.ProofResult.Passed;
+            }
+            if (satisfies) {
+                if (outcome instanceof CompiledCall.ParameterOutcome.StaticallyPassed) {
+                    updated.add(outcome);
+                } else {
+                    updated.add(new CompiledCall.ParameterOutcome.StaticallyPassed(i));
+                    changed = true;
+                }
+            } else {
+                if (outcome instanceof CompiledCall.ParameterOutcome.StaticallyFailed) {
+                    updated.add(outcome);
+                } else {
+                    String argDesc = arg instanceof SymExpr.Record r && r.typeName() != null
+                            ? "type '" + r.typeName() + "'"
+                            : "argument";
+                    updated.add(new CompiledCall.ParameterOutcome.StaticallyFailed(
+                            i,
+                            argDesc + " does not satisfy trait '" + paramSort.name() + "'"));
+                    changed = true;
+                }
+            }
+        }
+        return changed ? new CompiledCall(decl, arguments, updated) : call;
+    }
+
+    /**
+     * Upgrades a struct-base widen to {@code StaticallyPassed}: a {@link SymExpr.Record} argument
+     * whose concrete type is-a the parameter's (unrefined) struct type through the inheritance chain
+     * ({@code Exp is-a BiOp}) satisfies that parameter. {@link Refinements#satisfies} is a refinement
+     * engine and can't see the nominal base chain, so it reports such a widen as {@code Failed}; this
+     * restores it, mirroring {@link #enforceTraitParams} for traits and the call gate's
+     * {@code StaticDispatch#isStructBaseWiden}. A refined parameter is left untouched (its predicate
+     * obligation must still be checked); a same-type argument already passed and is unaffected.
+     */
+    private CompiledCall enforceStructBaseParams(
+            CompiledCall call, FunctionDecl decl, List<SymExpr> arguments) {
+        List<CompiledCall.ParameterOutcome> updated = new ArrayList<>(call.outcomes().size());
+        boolean changed = false;
+        for (CompiledCall.ParameterOutcome outcome : call.outcomes()) {
+            int i = outcome.parameterIndex();
+            sibarum.cardinal.core.types.Sort paramSort = decl.parameters().get(i).sort();
+            SymExpr arg = arguments.get(i);
+            boolean widens = !paramSort.isRefined()
+                    && !isTraitNameSort(paramSort)
+                    && arg instanceof SymExpr.Record r
+                    && r.typeName() != null
+                    && structDescendantOf(r.typeName(), paramSort.name());
+            if (widens && !(outcome instanceof CompiledCall.ParameterOutcome.StaticallyPassed)) {
+                updated.add(new CompiledCall.ParameterOutcome.StaticallyPassed(i));
+                changed = true;
+            } else {
+                updated.add(outcome);
+            }
+        }
+        return changed ? new CompiledCall(decl, arguments, updated) : call;
+    }
+
+    /** Whether {@code type}'s struct-inheritance chain reaches {@code ancestorStruct} as a PROPER base
+     *  (self excluded — a same-type mismatch must not be masked). Bare-tolerant, since the two names may
+     *  be qualified at different link stages. */
+    private boolean structDescendantOf(String type, String ancestorStruct) {
+        String wantBare = QualifiedName.memberOf(ancestorStruct);
+        List<String> ancestry = traitRegistry.structAncestry(type);
+        for (int i = 1; i < ancestry.size(); i++) {  // skip index 0 (the type itself)
+            String anc = ancestry.get(i);
+            if (anc.equals(ancestorStruct) || QualifiedName.memberOf(anc).equals(wantBare)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * True iff {@code sort} is a bare-named sort whose name is registered
+     * as a trait (has at least one satisfier). False for refined,
+     * structural, function, or unrecognized bare-named sorts.
+     */
+    private boolean isTraitNameSort(sibarum.cardinal.core.types.Sort sort) {
+        if (sort.isRefined() || sort.isStructural() || sort.isMethod()) {
+            return false;
+        }
+        return traitRegistry.isDeclaredTrait(sort.name());
+    }
+
+    /** The Stream trait, bare or linker-qualified (the one trait a bare tuple autoboxes to). */
+    private static boolean isStreamName(String name) {
+        return name != null && (name.equals("Stream") || name.endsWith("/Stream"));
+    }
+
+    /**
+     * Returns a {@link DispatchResult} from the trait-fallback path when
+     * the call name has the form {@code "Trait.method"} and the first
+     * argument's concrete type is a registered satisfier of the trait.
+     * Returns {@code null} (not NoMatch) when the fallback isn't
+     * applicable — letting the caller surface the original direct-lookup
+     * result instead of overwriting its diagnostic.
+     *
+     * <p>Resolution: extract {@code Trait} from the call name's leading
+     * dotted segment, peek at the first argument as a
+     * {@link SymExpr.Record} to find its concrete type name, check the
+     * {@link TraitRegistry}, then re-resolve against
+     * {@code ConcreteType.method}.
+     */
+    private DispatchResult resolveTraitFallback(
+            String name, List<SymExpr> arguments, Simplifier simplifier) {
+        // A key may be module-qualified (module/Trait.method); the module part
+        // can itself contain dots (a.b), so split off the module at the '/'
+        // boundary FIRST (via QualifiedName), then do the Trait.method split on
+        // the member part.
+        QualifiedName qn = QualifiedName.parse(name);
+        String modulePrefix = qn.isQualified() ? qn.module() + "/" : "";  // "module/" or ""
+        String local = qn.member();
+        int dot = local.indexOf('.');
+        if (dot <= 0 || dot >= local.length() - 1) return null;
+        String traitName = modulePrefix + local.substring(0, dot);  // module/Trait (or bare Trait)
+        String methodName = local.substring(dot + 1);
+        if (arguments.isEmpty()) return null;
+        SymExpr first = arguments.get(0);
+        if (!(first instanceof SymExpr.Record r)) return null;
+        String concreteType = r.typeName();  // already an FQN when linked (module/Type)
+        if (concreteType == null) return null;
+        if (!traitRegistry.satisfies(traitName, concreteType)) return null;
+        // Walk the concrete type's struct-inheritance chain (nearest-first, self included) to the
+        // ancestor that actually declares the method: an impl assigned to a base struct
+        // (`assign trait Base:Trait`) is keyed `Base.method`, not `Sub.method`, so a `Sub` value
+        // must redirect past its own name up to `Base`. The chain is linear, so the first hit is the
+        // most-specific impl. A single-element chain (no base) reproduces the old direct redirect.
+        for (String type : traitRegistry.structAncestry(concreteType)) {
+            String redirected = type + "." + methodName;  // module/Type.method
+            DispatchResult result = resolveDirect(redirected, arguments, simplifier);
+            // Suppress NoMatch (let the caller report the original trait-lookup error); a real
+            // Resolved or Ambiguous result wins.
+            if (!(result instanceof DispatchResult.NoMatch)) return result;
+        }
+        return null;
+    }
+
+    private boolean isStrictlyMoreSpecific(FunctionDecl a, FunctionDecl b, Simplifier simp) {
+        return Refinements.strictlyMoreSpecific(
+                paramSorts(a), paramSorts(b), simp, traitRegistry::isNominalSubtype);
+    }
+
+    private static List<Sort> paramSorts(FunctionDecl decl) {
+        List<Sort> sorts = new ArrayList<>(decl.parameters().size());
+        for (var p : decl.parameters()) sorts.add(p.sort());
+        return sorts;
+    }
+}

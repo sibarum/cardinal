@@ -1,0 +1,113 @@
+package sibarum.cardinal.ir;
+
+import sibarum.cardinal.core.types.RecordValue;
+
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * The native <b>call</b> registry — application-invoked natives, keyed by the resolved
+ * function name. The generalization of the retired {@code NativeSources}: any native function
+ * (0..n args, returning a value) registers here, and {@link IrInterpreter}'s resolved-call path
+ * invokes it with the evaluated arguments instead of running the Cardinal declaration's
+ * placeholder body. Covers {@code stdin} (0-arg → a {@link LiveSource}) and the GUI window
+ * function (args → opens a window, blocks, returns) alike.
+ *
+ * <p><b>Populated by extensions</b> (docs/extensions.md): the Cardinal-side interface declares the
+ * function with a placeholder body (e.g. {@code function stdin():Stream[String] -> {}}); the
+ * extension's Java object is bound here by name. Each call is registered under both its bare
+ * name and its module-qualified form, and {@link #get} also tries the bare suffix of a
+ * qualified resolved name — so a resolved decl name in either form finds its impl.
+ */
+public final class NativeCalls {
+
+    /**
+     * One native call: run the Java implementation against the evaluated arguments. The
+     * {@link Context} lets a long-running native (the GUI {@code window} loop) re-enter the
+     * substrate — firing a Cardinal event back through its {@code action}s, e.g. on a click.
+     * Most calls ignore it.
+     */
+    @FunctionalInterface
+    public interface NativeCall {
+        Object call(List<Object> args, Context ctx);
+    }
+
+    /**
+     * The interpreter handle a native call may use to re-enter the runtime — the seam for GUI
+     * interactivity (docs/extensions.md). A long-running native (the GUI {@code window} loop) uses
+     * it to drive program logic from outside the normal call flow:
+     * <ul>
+     *   <li>{@link #fireEvent} — fire a Cardinal event through the event substrate (run its matching
+     *       {@code action}s + native sink);</li>
+     *   <li>{@link #satisfies} — test whether a value's type satisfies a trait (e.g. is this
+     *       element {@code Clickable}?);</li>
+     *   <li>{@link #invoke} — invoke a 0-user-arg instance method on a value (e.g. a widget's
+     *       {@code onClick}), dispatching {@code <type>.<method>(this)}.</li>
+     * </ul>
+     * Backed by {@code IrInterpreter}.
+     */
+    public interface Context {
+        void fireEvent(RecordValue event);
+
+        boolean satisfies(RecordValue value, String traitName);
+
+        Object invoke(RecordValue value, String methodName);
+
+        /**
+         * The IR of an instance-method impl for {@code value}'s type — its parameters and body —
+         * or {@code null} if none resolves. The seam a code generator uses to <b>read</b> a
+         * method's definition instead of evaluating it: the SDF→GLSL lowerer inlines each shape's
+         * {@code distance} body into a shader (docs/sdf-glsl.md). Default {@code null} — only a
+         * context backed by a {@link CompiledModule} (the {@code IrInterpreter}) can supply it.
+         */
+        default CompiledModule.CompiledFunction methodImpl(RecordValue value, String methodName) {
+            return null;
+        }
+
+        /**
+         * Reflect a first-class function <b>value</b> — a metareference (a
+         * {@code sibarum.cardinal.core.types.Metaref} record) or a fragment/lambda
+         * ({@code Closure}) — to its parameters and IR body, or {@code null} if
+         * {@code fnValue} is not a function value (or its declaration can't be
+         * resolved). The free-function sibling of {@link #methodImpl}: the seam the
+         * {@code cardinal.algebra} reflection primitive ({@code astOf}) uses to read an
+         * algebraic function's expression tree instead of running it. Default
+         * {@code null} — only a {@link CompiledModule}-backed context supplies it.
+         */
+        default ReflectedFunction reflectFunction(Object fnValue) {
+            return null;
+        }
+
+        /**
+         * Reflect a function by name and arity to its parameters and IR body, or
+         * {@code null} if none resolves. Used to <b>inline</b> a nested call while
+         * reflecting an algebraic function (the callee is itself algebraic, so it
+         * has a body to inline; recursion is banned, so inlining terminates).
+         */
+        default ReflectedFunction reflectFunctionByName(String name, int arity) {
+            return null;
+        }
+    }
+
+    /** A reflected function value: its declared parameters and its IR body. */
+    public record ReflectedFunction(List<IrParam> params, IrExpr body) {}
+
+    private static final Map<String, NativeCall> ENTRIES = new LinkedHashMap<>();
+
+    private NativeCalls() {}
+
+    /** Binds {@code call} to {@code name} (extension install registers bare + qualified forms). */
+    public static void register(String name, NativeCall call) {
+        ENTRIES.put(name, call);
+    }
+
+    /** The native call for a resolved name, or null — exact match, else the bare suffix. */
+    public static NativeCall get(String name) {
+        if (name == null) return null;
+        NativeCall c = ENTRIES.get(name);
+        if (c != null) return c;
+        int slash = name.lastIndexOf('/');
+        return slash < 0 ? null : ENTRIES.get(name.substring(slash + 1));
+    }
+}

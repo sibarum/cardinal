@@ -1,0 +1,6625 @@
+package sibarum.cardinal.parser;
+
+import sibarum.cardinal.core.Origin;
+import sibarum.cardinal.ir.CallKinds;
+import sibarum.cardinal.ir.IrCompiler;
+import sibarum.cardinal.ir.IrExpr;
+import sibarum.cardinal.ir.IrModule;
+import sibarum.cardinal.ir.IrParam;
+import sibarum.cardinal.ir.IrSort;
+import sibarum.cardinal.ir.IrStmt;
+import sibarum.cardinal.types.TypeCatalog;
+import sibarum.cardinal.types.TypeInfo;
+
+import static sibarum.cardinal.parser.IrQueries.TUPLE_SENTINEL;
+import static sibarum.cardinal.parser.IrQueries.baseSortName;
+import static sibarum.cardinal.parser.IrQueries.describeSort;
+import static sibarum.cardinal.parser.IrQueries.extractDottedName;
+import static sibarum.cardinal.parser.IrQueries.isCapitalizedName;
+import static sibarum.cardinal.parser.IrQueries.isComparison;
+import static sibarum.cardinal.parser.IrQueries.isOrderComparison;
+import static sibarum.cardinal.parser.IrQueries.isPositionalKey;
+import static sibarum.cardinal.parser.IrQueries.isSelfType;
+import static sibarum.cardinal.parser.IrQueries.isStar;
+import static sibarum.cardinal.parser.IrQueries.isUnknownSort;
+import static sibarum.cardinal.parser.IrQueries.sameBaseName;
+import static sibarum.cardinal.parser.IrQueries.selfToFieldAccess;
+
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Deque;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+/**
+ * Recursive-descent parser for the Cardinal surface syntax — see {@code docs/language-reference.ptf}.
+ *
+ * <p>Load-bearing principles the parser enforces:
+ * <ol>
+ *   <li><b>Brackets wrap sorts.</b> {@code [...]} is the universal sort delimiter.
+ *   <li><b>Colon narrows.</b> {@code :} is "narrows to" — param sorts, refinement
+ *       predicates, struct field constraints, function return types.
+ *   <li><b>{@code @} is the principal subject</b> of the enclosing refinement
+ *       (value being refined / scrutinee). Each refinement binds its own
+ *       {@code @}; nested refinements shadow.
+ *   <li><b>{@code |}/{@code &}/{@code !}</b> are the logical operators at every
+ *       level. There are no {@code &&}/{@code ||} — bitwise doesn't exist.
+ *   <li><b>Implicit {@code @==EXPR}</b> sugar applies when a refinement
+ *       predicate has no top-level comparison.
+ *   <li><b>Base-inference</b>: {@code [pred]} (no base) is legal where context
+ *       provides exactly one base sort (e.g., a match arm whose scrutinee has a
+ *       single inferred base). Required to be explicit otherwise.
+ *   <li><b>Module lists use {@code X.{a, b, c}}</b> — brackets are reserved for sorts.
+ *   <li><b>Match is total</b> — every match must exhaustively cover its scrutinee's
+ *       sort, proved at compile time.
+ * </ol>
+ *
+ * <p>Built in stages (vertical slices). The current slice's scope is documented
+ * at each method.
+ */
+public final class CardinalParser {
+
+    /**
+     * Reserved sentinel name for anonymous positional aggregates (tuples) —
+     * the positional sibling of the {@code "_record"} sentinel used for
+     * anonymous by-name records. Tuple members are keyed positionally
+     * ({@code _0 .. _n}); the name marks the aggregate as a tuple for display
+     * and keeps tuples from being mistaken for a declared struct.
+     */
+
+    /**
+     * Keywords are recognized by text at parse time, not by token kind.
+     * Public because tooling (the playground's syntax highlighter) consumes
+     * this set as the single source of truth for the keyword vocabulary —
+     * a new keyword added here highlights everywhere without a second list
+     * to update.
+     */
+    public static final Set<String> KEYWORDS = Set.of(
+            "module", "requires", "exports",
+            "function", "method", "struct", "let", "cast",
+            "assign", "trait", "Type", "type",
+            "match", "proof", "main", "emit", "action", "conduit", "conductor", "spawn",
+            "if", "then", "else",
+            "true", "false");
+
+    /** Standard precedence for binary operators (higher = tighter). */
+    private static int precedence(String op) {
+        return switch (op) {
+            case "|" -> 1;                              // logical/union OR
+            case "&" -> 2;                              // logical/intersection AND
+            case "==", "!=", "~=" -> 3;
+            case "<", "<=", ">", ">=" -> 4;
+            case "+", "-" -> 5;
+            case "*", "/", "%" -> 6;
+            case "^" -> 7;                              // power — binds tighter than * (left-assoc for now)
+            default -> -1;
+        };
+    }
+
+    private static IrExpr.Op opKind(String op) {
+        return switch (op) {
+            case "+" -> IrExpr.Op.ADD;
+            case "-" -> IrExpr.Op.SUB;
+            case "*" -> IrExpr.Op.MUL;
+            case "/" -> IrExpr.Op.DIV;
+            case "%" -> IrExpr.Op.MOD;
+            case "^" -> IrExpr.Op.POW;
+            case "<" -> IrExpr.Op.LT;
+            case "<=" -> IrExpr.Op.LE;
+            case ">" -> IrExpr.Op.GT;
+            case ">=" -> IrExpr.Op.GE;
+            case "==" -> IrExpr.Op.EQ;
+            case "!=" -> IrExpr.Op.NE;
+            case "~=" -> IrExpr.Op.APPROX;
+            case "&" -> IrExpr.Op.AND;
+            case "|" -> IrExpr.Op.OR;
+            default -> throw new IllegalArgumentException("Unknown operator: " + op);
+        };
+    }
+
+
+    private final List<CardinalToken> tokens;
+    private int pos;
+    /** Counter for synthesizing fresh names — used by the structural-destructure desugar. */
+    private int syntheticCounter = 0;
+
+    /**
+     * Scope of names → declared sort, used to infer contextual base sorts for
+     * match-arm patterns. Populated from function/method/lambda params; cleared
+     * on body exit.
+     */
+    private final Map<String, IrSort> currentScope = new LinkedHashMap<>();
+
+    /**
+     * Stack of "expected base sort name" frames pushed by {@link #parseMatch}.
+     * When a bracket-form refinement omits the base (contextual form
+     * {@code [pred]}), the parser pops the stack top to use as the base.
+     * Empty-string entries mark frames where no base could be inferred — the
+     * contextual form is then rejected with a helpful error.
+     */
+    private final Deque<String> contextualBaseStack = new ArrayDeque<>();
+
+    /**
+     * The types declared so far in the current parse — structs, traits, and sort aliases — in the
+     * consolidated {@link TypeCatalog} (the single registry shared with the IR side). Populated as each
+     * declaration is parsed; consulted to resolve struct field sorts (e.g. {@code [Point(x, y)]}),
+     * classify annotation names, and answer coercion queries. A name absent here is not (yet) declared
+     * in this file — a forward or cross-module reference, deferred to link time. Required to be populated
+     * BEFORE a struct is used by name — slice-5 restriction.
+     */
+    private final TypeCatalog types = new TypeCatalog();
+
+    /**
+     * The user-declared struct shape for {@code name}, or null — the parser's historical
+     * {@code declaredStructs.get} semantics (a native constructor or primitive is <em>not</em> a
+     * declared struct here; {@link #patternShapeFor} is the one place that also admits natives).
+     */
+    private IrSort.Structural declaredStructShape(String name) {
+        return types.lookup(name).orElse(null) instanceof TypeInfo.Struct s ? s.shape() : null;
+    }
+
+    /**
+     * Struct-pattern members that were given as positional <em>literals</em>
+     * ({@code [Ternion(z, 0, w)]} — constrain the field, bind nothing). Keyed by
+     * the pattern's identity; the destructure desugar skips these in its
+     * let-wrap so the field name isn't silently bound (which could shadow an
+     * outer binding the user never asked to shadow).
+     */
+    private final Map<IrSort, java.util.Set<String>> literalConstrainedFields =
+            new java.util.IdentityHashMap<>();
+
+    /** Extra declarations emitted by a top-level destructuring let (one per bound field). */
+    private final List<IrStmt> pendingTopLevelDecls = new ArrayList<>();
+
+    /**
+     * Positional rename binders per struct pattern: field name → binder name.
+     * A bare ident clause that is NOT a declared field name binds the field at
+     * its clause position under the given name ({@code [Ternion(first, second,
+     * third)]}); idents that ARE field names stay name-keyed as before.
+     */
+    private final Map<IrSort, Map<String, String>> destructureRenames =
+            new java.util.IdentityHashMap<>();
+
+    /**
+     * Identity set of {@link IrSort.Structural} patterns whose struct was NOT in
+     * {@link #types} at parse time (cross-module / imported). Their
+     * slots are keyed positionally ({@code _0.._n}) with binder/discard roles
+     * encoded in the slot sorts via {@link #DEFERRED_BIND}/{@link #DEFERRED_SKIP};
+     * the post-link {@code DestructureResolver} maps slots to declared field
+     * names and runs the arity-total check. Used here only to skip the
+     * <em>parse-time</em> binding desugar for these patterns (the resolver does
+     * it post-link, when field names are known).
+     */
+    private final java.util.Set<IrSort> deferredStructPatterns =
+            java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+
+    /**
+     * Slot-sort encodings for a DEFERRED positional struct pattern (see
+     * {@link #deferredStructPatterns}). A slot bound to binder {@code x} carries
+     * sort {@code Named("_$bind$x")}; a {@code _} discard carries
+     * {@code Named("_$skip$")}. {@code DestructureResolver} decodes them after
+     * the struct's declared fields are known. The constants live in
+     * {@code cardinal-ir} (which the parser depends on) so both sides share one
+     * source of truth.
+     */
+    static final String DEFERRED_BIND = sibarum.cardinal.ir.DestructureResolver.DEFERRED_BIND;
+    static final String DEFERRED_SKIP = sibarum.cardinal.ir.DestructureResolver.DEFERRED_SKIP;
+
+    /**
+     * True while parsing a destructure/match <em>pattern</em> (as opposed to a
+     * type annotation). Tuples — unlike structs — have no declared type to
+     * disambiguate sort-elements from binder-elements, so the tuple-sort parser
+     * ({@link #parseTupleSortBody}) consults this flag: when set, {@code (a, b)}
+     * elements are positional binders / {@code _} discards; when clear, they are
+     * component sorts. Set around the pattern-parse calls in {@link #parseMatch},
+     * {@link #parseDestructuringLetExpr}, and {@link #parseDestructuringLetTop}.
+     */
+    private boolean parsingTuplePattern = false;
+
+    /**
+     * Top-level let-bindings declared so far, keyed by their (possibly dotted)
+     * name. Maps to the binding's inferred sort. Two uses: (1) bare references
+     * to a let name in expression position get rewritten to a 0-arg
+     * {@link IrExpr.Call} so dispatch can find the binding; (2) feeds
+     * {@link #inferMaximalSort} when a later let references an earlier one.
+     */
+    private final Map<String, IrSort> declaredTopLevelLets = new LinkedHashMap<>();
+
+    /**
+     * Explicit type-applications of generic functions seen this parse —
+     * {@code map[Int,String](…)} (docs/stream-war.md §8b). Keyed by the mangled
+     * specialization name; the value is the generic function name + its type args. At
+     * module assembly each entry becomes a concrete specialization FunctionDecl.
+     */
+    private record PendingInstantiation(String genericName, List<IrSort> typeArgs) {}
+
+    private final Map<String, PendingInstantiation> pendingTypeInstantiations = new LinkedHashMap<>();
+
+    /**
+     * Signatures of declared GENERIC functions (non-empty {@code [type …]} slots), for
+     * inferring type args at a bare call {@code map(s, $d[Int])}: unify each param sort
+     * against the argument's inferred sort to recover the type params, then reuse the
+     * explicit-instantiation path (docs/stream-war.md §8b). Inference is a convenience —
+     * explicit {@code map[Int,R](…)} always works; this just lets you omit the args.
+     */
+    private record GenericSignature(List<IrParam> params, List<String> typeParams) {}
+
+    private final Map<String, GenericSignature> declaredGenericSignatures = new LinkedHashMap<>();
+
+    /**
+     * Latest declared return sort for each function/method name (most-recent
+     * overload wins). Consulted by {@link #inferMaximalSort} for {@link
+     * IrExpr.Call} expressions, where the per-call narrowing isn't computed yet
+     * (that's the in-progress "Dispatch as the star" priority work — see
+     * TODO.md). For now, inference uses the declared return sort as a lossy
+     * upper bound on the call's actual narrowing.
+     */
+    private final Map<String, IrSort> declaredFunctionReturns = new LinkedHashMap<>();
+
+    /**
+     * Names of declared 0-arg functions (functions whose param list is empty).
+     * Treated equivalently to top-level lets at bare-access sites — both are
+     * 0-arg dispatch entries, both auto-Call on unqualified or dotted bare
+     * reference. Populated only for {@code function} decls; methods always
+     * have at least the {@code self} param.
+     */
+    private final Set<String> declaredZeroArgFunctions = new java.util.HashSet<>();
+
+
+    /** Parse-time type reasoning, reading this parser's live scope maps and shared catalog. */
+    private final ParseTimeInference inference =
+            new ParseTimeInference(types, currentScope, declaredTopLevelLets, declaredFunctionReturns);
+
+    public CardinalParser(List<CardinalToken> tokens) {
+        this.tokens = List.copyOf(tokens);
+    }
+
+    public static IrModule parseModule(String src, String source) throws ParseException {
+        CardinalParser p = new CardinalParser(new CardinalLexer(src, source).tokenize());
+        return p.parseModule();
+    }
+
+    // --- SexprToken cursor ---
+
+    private CardinalToken peek() {
+        return tokens.get(pos);
+    }
+
+    private CardinalToken peek(int offset) {
+        int idx = pos + offset;
+        if (idx >= tokens.size()) return tokens.get(tokens.size() - 1);
+        return tokens.get(idx);
+    }
+
+    private CardinalToken consume() {
+        return tokens.get(pos++);
+    }
+
+    private CardinalToken expect(CardinalToken.Kind kind) throws ParseException {
+        CardinalToken t = peek();
+        if (t.kind() != kind) {
+            throw new ParseException(
+                    "Expected " + kind + " but got " + t.kind() + " ('" + t.text() + "')",
+                    t.origin());
+        }
+        return consume();
+    }
+
+    private CardinalToken expectKeyword(String text) throws ParseException {
+        CardinalToken t = expect(CardinalToken.Kind.IDENT);
+        if (!t.text().equals(text)) {
+            throw new ParseException(
+                    "Expected keyword '" + text + "' but got '" + t.text() + "'",
+                    t.origin());
+        }
+        return t;
+    }
+
+    private boolean checkKeyword(String text) {
+        CardinalToken t = peek();
+        return t.kind() == CardinalToken.Kind.IDENT && t.text().equals(text);
+    }
+
+    /**
+     * The shared member-boundary rule for every brace/paren-delimited type body —
+     * trait, struct, and conductor. Members are <em>terminated</em>, not
+     * comma-separated: after one member is fully parsed, the next is recognized when
+     * either an explicit {@code ;} terminator is present (consumed here) or the next
+     * token simply starts on a later source line — a newline ends the member, no
+     * punctuation required. This is what lets a defaulted method whose body ends in
+     * {@code -> {this}} sit on its own line with nothing trailing it.
+     *
+     * <p>{@code ,} is accepted as a transitional alias for {@code ;} while the docs
+     * and examples migrate off comma-separation; it behaves identically. A member
+     * that shares a line with the previous one and supplies no explicit terminator is
+     * the single genuine error — that is exactly the greedy-continuation case where an
+     * explicit {@code ;} earns its keep.
+     *
+     * <p>Called in place of the old {@code while (peek()!=close) { if(!first) expect(COMMA); }}
+     * pair: it folds the loop-continuation test and the separator consumption into one
+     * call so the three body parsers can't drift apart again.
+     *
+     * @param first whether this is the first member (no preceding terminator to read)
+     * @param close the block's closing token ({@code RBRACE} for trait/conductor,
+     *              {@code RPAREN} for struct fields)
+     * @return {@code true} to parse another member, {@code false} when the block is over
+     */
+    private boolean atMemberBoundary(boolean first, CardinalToken.Kind close) throws ParseException {
+        if (peek().kind() == close) return false;
+        if (first) return true;
+        if (peek().kind() == CardinalToken.Kind.SEMICOLON || peek().kind() == CardinalToken.Kind.COMMA) {
+            consume();                                   // explicit terminator (`,` = transitional alias)
+            return peek().kind() != close;               // a trailing terminator before the close is fine
+        }
+        // No explicit terminator: the previous member must have ended on an earlier
+        // line than this one (a newline terminates it). `pos-1` is that member's last
+        // consumed token.
+        if (peek().line() > tokens.get(pos - 1).line()) return true;
+        throw new ParseException(
+                "members are separated by a newline or ';'; found '" + peek().text()
+                        + "' on the same line as the previous member — add a ';' between them",
+                peek().origin());
+    }
+
+    // --- Top-level ---
+
+    public IrModule parseModule() throws ParseException {
+        String moduleName = "_anonymous";
+        if (checkKeyword("module")) {
+            consume();
+            moduleName = parseDottedName();
+        }
+        List<IrStmt> stmts = new ArrayList<>();
+        while (peek().kind() != CardinalToken.Kind.EOF
+                && !checkKeyword("main")
+                && !isMainExpressionStart()) {
+            stmts.add(parseTopLevelDecl());
+            // A top-level destructuring let emits one decl per bound field on
+            // top of the decl returned above — drain them in order.
+            if (!pendingTopLevelDecls.isEmpty()) {
+                stmts.addAll(pendingTopLevelDecls);
+                pendingTopLevelDecls.clear();
+            }
+        }
+        // Executable logic belongs in an explicit `main ( … )` block
+        // (docs/events.md Slice 0). During the migration window a bare trailing
+        // expression is still accepted as the LEGACY entry form — to be retired
+        // to a hard error (declarative-only top level) once the corpus moves to
+        // `main { }`. Neither present ⇒ declarative-only, a dormant placeholder
+        // main; only the entrypoint file's main is driven by the runtime.
+        boolean hadMain = checkKeyword("main");
+        IrExpr main;
+        if (hadMain) {
+            main = parseMainStatement();
+        } else if (peek().kind() != CardinalToken.Kind.EOF) {
+            main = parseExpr();  // legacy trailing-expression main (migration window)
+        } else {
+            main = new IrExpr.Lit(0, Origin.NONE);
+        }
+        if (peek().kind() != CardinalToken.Kind.EOF) {
+            throw new ParseException(
+                    "Trailing tokens after " + (hadMain ? "main statement" : "main expression")
+                            + "; got " + peek().kind() + " '" + peek().text() + "'",
+                    peek().origin());
+        }
+        stmts.addAll(generateInstantiations(stmts));
+        return new IrModule(moduleName, stmts, main);
+    }
+
+    /**
+     * The entry point: {@code main STATEMENT}. {@code main} is followed by a
+     * single statement (an expression); the user MAY group it with parens like
+     * any statement ({@code main ( let …; expr )}), but parens are not required
+     * by the construct — {@code ()} is user-owned, not a language-reserved block
+     * delimiter (unlike {@code []}/{@code {}}). Sequencing is via let-in chains
+     * (a {@code let x = …} continues into its body). Only the entrypoint file's
+     * main is driven — a required module's main stays dormant (docs/events.md S0).
+     */
+    private IrExpr parseMainStatement() throws ParseException {
+        expectKeyword("main");
+        return parseExpr();
+    }
+
+    /**
+     * The event-emission statement (docs/events.md, slice 1b): {@code emit EVENT BODY}
+     * — statement-shaped like {@code let}. The {@code EVENT} is an event construction
+     * (e.g. {@code StdOut("hi")}); the rest of the enclosing expression is the
+     * continuation {@code BODY}, sequenced exactly as a {@code let} threads into its
+     * body. Lowers to {@link IrExpr.Emit}, a dedicated node (not a {@code Call}): the
+     * runtime routes the event by its type, discards the write-only result, and yields
+     * the body. {@code emit} is a reserved keyword, so it never collides with a name.
+     */
+    private IrExpr parseEmitStatement() throws ParseException {
+        CardinalToken start = expectKeyword("emit");
+        IrExpr event = parseExpr();
+        IrExpr body = parseExpr();
+        return new IrExpr.Emit(event, body, start.origin());
+    }
+
+    /**
+     * Conductor state assignment {@code this.field = value  cont} (docs/orchestration.md) —
+     * statement-shaped like {@code emit}/{@code let}: the write runs for effect, then the
+     * continuation is the value. To avoid a new {@code IrExpr} node (and the sealed-switch sweep
+     * that follows one), it desugars to the reserved call {@code #assign-self#(field, value)} —
+     * which the interpreter recognizes and applies to the firing conductor's state cell — sequenced
+     * before the continuation via a discard {@code let}. Precondition: {@link #inConductorHandler}.
+     */
+    private IrExpr parseSelfAssignment() throws ParseException {
+        CardinalToken self = expect(CardinalToken.Kind.IDENT);          // `this`
+        expect(CardinalToken.Kind.DOT);
+        CardinalToken field = expect(CardinalToken.Kind.IDENT);
+        expect(CardinalToken.Kind.EQUALS);
+        IrExpr value = parseExpr();
+        IrExpr cont = parseExpr();
+        IrExpr write = new IrExpr.Call("#assign-self#",
+                List.of(new IrExpr.Str(field.text(), field.origin()), value), self.origin());
+        return new IrExpr.LetIn("#assigned#" + (assignSeq++), IrSort.named("_"), write, cont,
+                self.origin());
+    }
+
+    /** Monotonic counter making each self-assignment's discard binding name unique. */
+    private int assignSeq = 0;
+
+    /**
+     * Materializes one concrete {@link IrStmt.FunctionDecl} per explicit
+     * type-application (docs/stream-war.md §8b). A generic function's param and return
+     * sorts are substituted with the supplied type args; the body and the declared
+     * type-params are KEPT (so any residual type-var in the body — e.g. a fragment's
+     * {@code (el:A)} — stays in scope for the checker), and the decl gets the mangled
+     * name the call sites target. The result is a CONCRETE-parametered decl that
+     * dispatches without inference.
+     */
+    private List<IrStmt> generateInstantiations(List<IrStmt> stmts) {
+        List<IrStmt> specializations = new ArrayList<>();
+        for (Map.Entry<String, PendingInstantiation> e : pendingTypeInstantiations.entrySet()) {
+            PendingInstantiation inst = e.getValue();
+            IrStmt.FunctionDecl generic = null;
+            for (IrStmt s : stmts) {
+                if (s instanceof IrStmt.FunctionDecl fd
+                        && fd.name().equals(inst.genericName())
+                        && !fd.typeParams().isEmpty()) {
+                    generic = fd;
+                    break;
+                }
+            }
+            if (generic == null) continue;  // unknown/non-generic — dispatch surfaces it
+            List<String> tps = new ArrayList<>(generic.typeParams().keySet());
+            if (tps.size() != inst.typeArgs().size()) continue;  // arity off — let it fail downstream
+            Map<String, IrSort> binds = new LinkedHashMap<>();
+            for (int i = 0; i < tps.size(); i++) binds.put(tps.get(i), inst.typeArgs().get(i));
+            List<IrParam> sparams = new ArrayList<>(generic.params().size());
+            for (IrParam p : generic.params()) {
+                sparams.add(new IrParam(p.name(),
+                        sibarum.cardinal.ir.SortChecker.substituteTypeVars(p.sort(), binds)));
+            }
+            IrSort sret = sibarum.cardinal.ir.SortChecker.substituteTypeVars(generic.returnSort(), binds);
+            specializations.add(new IrStmt.FunctionDecl(
+                    e.getKey(), sparams, sret, generic.body(), generic.origin(),
+                    generic.topLevelLet(), generic.typeParams()));
+        }
+        return specializations;
+    }
+
+    /**
+     * Lookahead from a {@code [} at {@code peek()}: is this an explicit type-application
+     * {@code name[…](}, i.e. does the matching {@code ]} immediately precede a {@code (}?
+     * Only then is {@code name[…]} a generic instantiation. This keeps a braceless match
+     * arm ({@code match value [@>2] -> …}, where {@code ]} is followed by {@code ->}) from
+     * being mis-read as type-application. Counts only bracket nesting; parens inside the
+     * type args (e.g. {@code [Dispatch(Int):R]}) don't affect the depth.
+     */
+    private boolean typeApplicationAhead() {
+        int depth = 0;
+        for (int i = 0; ; i++) {
+            CardinalToken.Kind k = peek(i).kind();
+            if (k == CardinalToken.Kind.EOF) return false;
+            if (k == CardinalToken.Kind.LBRACKET) {
+                depth++;
+            } else if (k == CardinalToken.Kind.RBRACKET) {
+                depth--;
+                if (depth == 0) return peek(i + 1).kind() == CardinalToken.Kind.LPAREN;
+            }
+        }
+    }
+
+    /**
+     * True when {@code peek()} is a {@code {} opening a by-name aggregate — the
+     * next two tokens are {@code IDENT =}. Distinguishes a by-name struct literal
+     * {@code Foo{x = …}} from a positional aggregate {@code Foo{1, 2}} so the
+     * deferred (parser-blind, imported-struct) literal path fires only for the
+     * by-name form.
+     */
+    private boolean byNameAggregateAhead() {
+        return peek().kind() == CardinalToken.Kind.LBRACE
+                && peek(1).kind() == CardinalToken.Kind.IDENT
+                && peek(2).kind() == CardinalToken.Kind.EQUALS;
+    }
+
+    /**
+     * Infers a generic function's type args at a bare call by unifying each param sort
+     * against the argument's inferred sort (docs/stream-war.md §8b). Returns the mangled
+     * specialization name (recording the instantiation) when every type param is solved,
+     * else null — the caller then leaves the plain call, and explicit {@code f[T](…)} is
+     * required. Skips calls with spread args (the unification target there is an element,
+     * a later refinement).
+     */
+    private String inferGenericInstantiation(String name, List<IrExpr> args) {
+        GenericSignature sig = declaredGenericSignatures.get(name);
+        if (sig == null || anySpread(args) || sig.params().size() != args.size()) return null;
+        // Only monomorphize when the call genuinely can't dispatch as-is: a parameter
+        // whose sort is a `Dispatch(A):R` mentioning a type var — exact-key matching
+        // rejects a metaref there (the generic-map gap). For type vars that appear only
+        // in plain params/return (`idd[E](x:E):E`), the existing call-site derivation
+        // (type-parameters slice 2b) already flows the PRECISE narrowing into the return
+        // for the gate; monomorphizing would coarsen it to the base — so defer to it.
+        boolean needsMono = false;
+        for (IrParam p : sig.params()) {
+            if (p.sort() instanceof IrSort.CallSig d
+                    && CallKinds.builtin(d.typeName()) == CallKinds.Kind.DISPATCH
+                    && d.paramSorts().stream().anyMatch(k ->
+                            k instanceof IrSort.Named kn && sig.typeParams().contains(kn.name()))) {
+                needsMono = true;
+                break;
+            }
+        }
+        if (!needsMono) return null;
+        Map<String, IrSort> binds = new LinkedHashMap<>();
+        for (int i = 0; i < args.size(); i++) {
+            unifyTypeParam(sig.params().get(i).sort(), inference.maximalSort(args.get(i)),
+                    sig.typeParams(), binds);
+        }
+        List<IrSort> typeArgs = new ArrayList<>(sig.typeParams().size());
+        for (String tp : sig.typeParams()) {
+            IrSort bound = binds.get(tp);
+            if (bound == null) return null;  // unsolved — fall back to requiring explicit
+            typeArgs.add(bound);
+        }
+        String mangled = mangleInstantiation(name, typeArgs);
+        pendingTypeInstantiations.putIfAbsent(mangled, new PendingInstantiation(name, typeArgs));
+        return mangled;
+    }
+
+    /**
+     * One-directional unification of a generic param sort (which may mention type vars)
+     * against an argument's concrete inferred sort, recording each solved type var's base
+     * sort into {@code binds} (first binding wins). Handles a bare type var, a parametric
+     * head ({@code Stream[A]} vs {@code Stream[Int]}), and a {@code Dispatch(A):R} contract
+     * (keys + return). Shapes it can't match are skipped — best-effort, like the
+     * construction gate's type-param derivation.
+     */
+    private void unifyTypeParam(IrSort param, IrSort arg, List<String> tvars, Map<String, IrSort> binds) {
+        if (param instanceof IrSort.Named pn) {
+            if (pn.typeArgs().isEmpty() && tvars.contains(pn.name())) {
+                String base = baseSortName(arg);
+                if (base != null) binds.putIfAbsent(pn.name(), IrSort.named(base));
+                return;
+            }
+            if (!pn.typeArgs().isEmpty() && headMatches(pn.name(), arg)) {
+                List<IrSort> aArgs = sortTypeArgs(arg);
+                if (aArgs.size() == pn.typeArgs().size()) {
+                    for (int i = 0; i < aArgs.size(); i++) {
+                        unifyTypeParam(pn.typeArgs().get(i), aArgs.get(i), tvars, binds);
+                    }
+                }
+            }
+            return;
+        }
+        if (param instanceof IrSort.CallSig pd && arg instanceof IrSort.CallSig ad
+                && CallKinds.builtin(pd.typeName()) == CallKinds.Kind.DISPATCH
+                && CallKinds.builtin(ad.typeName()) == CallKinds.Kind.DISPATCH) {
+            if (pd.paramSorts().size() == ad.paramSorts().size()) {
+                for (int i = 0; i < pd.paramSorts().size(); i++) {
+                    unifyTypeParam(pd.paramSorts().get(i), ad.paramSorts().get(i), tvars, binds);
+                }
+            }
+            unifyTypeParam(pd.returnSort(), ad.returnSort(), tvars, binds);
+        }
+    }
+
+    /** The applied type args of a sort, across the forms that carry them (§8.6 trait carrier incl.). */
+    private static List<IrSort> sortTypeArgs(IrSort s) {
+        return switch (s) {
+            case IrSort.Named n -> n.typeArgs();
+            case IrSort.Refined r -> r.typeArgs();
+            case IrSort.Trait t -> t.typeArgs();
+            default -> List.of();
+        };
+    }
+
+    /** Whether {@code arg}'s head name is {@code name}, bare or linker-qualified ({@code …/name}). */
+    private boolean headMatches(String name, IrSort arg) {
+        String b = baseSortName(arg);
+        return b != null && (b.equals(name) || b.endsWith("/" + name));
+    }
+
+    /** Mangles a concrete specialization name: {@code map[Int,String]} → {@code map$Int$String}. */
+    private String mangleInstantiation(String name, List<IrSort> typeArgs) {
+        StringBuilder sb = new StringBuilder(name);
+        for (IrSort a : typeArgs) {
+            String base = baseSortName(a);
+            sb.append("$").append(base == null ? "_" : base);
+        }
+        return sb.toString();
+    }
+
+    /** Heuristic: a top-level construct starts with a known decl keyword. */
+    private boolean isMainExpressionStart() {
+        CardinalToken t = peek();
+        if (t.kind() != CardinalToken.Kind.IDENT) return true;
+        return !Set.of("module", "requires", "exports",
+                "function", "method", "struct", "let", "trait", "cast", "assign", "proof",
+                "action", "conduit", "conductor", "spawn").contains(t.text());
+    }
+
+    private String parseDottedName() throws ParseException {
+        CardinalToken first = expect(CardinalToken.Kind.IDENT);
+        StringBuilder sb = new StringBuilder(first.text());
+        while (peek().kind() == CardinalToken.Kind.DOT && peek(1).kind() == CardinalToken.Kind.IDENT) {
+            consume();  // DOT
+            sb.append('.').append(consume().text());
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Parses a declaration name. Three shapes:
+     * <ul>
+     *   <li>dotted identifier — {@code factorial}, {@code Point.zero};</li>
+     *   <li>a <b>bare operator</b> — {@code function +(l, r)} registers the
+     *       operator as a free generic under the bare key {@code +}. Only
+     *       {@link #OVERLOADABLE_OPS overloadable operators} are valid as
+     *       names ({@code &}/{@code |} and unknown ops are rejected here);</li>
+     *   <li>a trailing {@code .OP} segment — {@code Point.+} registers under
+     *       the dispatch key {@code Point.+} (the legacy method-style form,
+     *       kept as a routing fallback).</li>
+     * </ul>
+     */
+    private String parseDeclarationName() throws ParseException {
+        if (peek().kind() == CardinalToken.Kind.OP) {
+            CardinalToken opTok = consume();
+            if (!OVERLOADABLE_OPS.contains(opTok.text())) {
+                throw new ParseException(
+                        "'" + opTok.text() + "' is not an overloadable operator "
+                                + "(overloadable: + - * / % < <= > >= == !=)",
+                        opTok.origin());
+            }
+            return opTok.text();
+        }
+        String name = parseDottedName();
+        if (peek().kind() == CardinalToken.Kind.DOT && peek(1).kind() == CardinalToken.Kind.OP) {
+            consume();  // DOT
+            CardinalToken opTok = consume();
+            return name + "." + opTok.text();
+        }
+        return name;
+    }
+
+    private IrStmt parseTopLevelDecl() throws ParseException {
+        CardinalToken head = peek();
+        if (head.kind() != CardinalToken.Kind.IDENT) {
+            throw new ParseException(
+                    "Expected a top-level declaration (function / struct / let / requires / "
+                            + "exports / method); got " + head.kind() + " '" + head.text() + "'",
+                    head.origin());
+        }
+        return switch (head.text()) {
+            case "requires" -> parseRequires();
+            case "exports"  -> parseExports();
+            case "function" -> parseFunction();
+            case "struct"   -> parseStruct();
+            case "method"   -> parseMethod();
+            case "cast"     -> parseCoercion();
+            case "let"      -> parseLet();
+            case "trait"    -> parseTrait();
+            case "assign"   -> parseAssign();
+            case "proof"    -> parseProof();
+            case "action"   -> parseAction();
+            case "conduit"  -> parseConduit();
+            case "conductor" -> parseConductor();
+            case "spawn"    -> parseSpawn();
+            default -> throw new ParseException(
+                    "'" + head.text() + "' is not a top-level declaration. The top level is "
+                            + "declarative only (module / requires / exports / function / method / "
+                            + "struct / let / cast / trait / assign / proof / action / conduit / conductor); executable logic must "
+                            + "live inside a `main { … }` block (docs/events.md Slice 0).",
+                    head.origin());
+        };
+    }
+
+    // --- Declarations: requires / exports ---
+    // Form: `requires X.{name, name, ...}` and `exports @.{name, name, ...}`.
+    // Lower to structured IrStmt.Requires/Exports; the module loader/linker and
+    // name resolver consume them. Inert when a single file compiles on its own.
+
+    private IrStmt parseRequires() throws ParseException {
+        CardinalToken start = expectKeyword("requires");
+        if (peek().kind() == CardinalToken.Kind.DOLLAR) {
+            // Data require: `requires $a.b.c` imports the terminal VALUE of the
+            // data file `$a.b.c.ptf` (a bare object literal) under the local
+            // name of its last FQN segment. There is no `.{…}` entry list — the
+            // whole file IS one value, bound once. The `$` is kept on the target
+            // so ModuleResolver resolves it by literal filename rather than the
+            // module-header sibling scan (a data file has no `module` header).
+            consume();                                       // DOLLAR
+            CardinalToken firstName = expect(CardinalToken.Kind.IDENT);
+            StringBuilder fqn = new StringBuilder(firstName.text());
+            String lastSeg = firstName.text();
+            while (peek().kind() == CardinalToken.Kind.DOT && peek(1).kind() == CardinalToken.Kind.IDENT) {
+                consume();                                   // DOT
+                CardinalToken seg = consume();                    // IDENT
+                fqn.append('.').append(seg.text());
+                lastSeg = seg.text();
+            }
+            CardinalToken end = tokens.get(pos - 1);
+            return new IrStmt.Requires(
+                    "$" + fqn,
+                    List.of(new IrStmt.RequireEntry(lastSeg, lastSeg)),
+                    start.spanTo(end));
+        }
+        String target = parseDottedName();
+        List<IrStmt.RequireEntry> entries = parseDotBraceEntryList();
+        CardinalToken last = tokens.get(pos - 1);
+        return new IrStmt.Requires(target, entries, start.spanTo(last));
+    }
+
+    private IrStmt parseExports() throws ParseException {
+        CardinalToken start = expectKeyword("exports");
+        boolean self = false;
+        if (peek().kind() == CardinalToken.Kind.AT) {
+            consume();
+            self = true;
+        } else {
+            // A non-`@` qualifier (re-export of another module) — parse and keep
+            // the names; the qualifier itself is unused until re-exports land.
+            parseDottedName();
+        }
+        List<IrStmt.RequireEntry> entries = parseDotBraceEntryList();
+        List<String> names = new ArrayList<>(entries.size());
+        for (IrStmt.RequireEntry entry : entries) {
+            if (!entry.remoteName().equals(entry.localName())) {
+                // Exports rename (public name != internal name) needs a
+                // public→internal mapping in the export tables — parked.
+                throw new ParseException(
+                        "Exports rename ('" + entry.remoteName() + " -> "
+                                + entry.localName() + "') is not yet supported — "
+                                + "an exports list takes plain names for now",
+                        start.origin());
+            }
+            names.add(entry.localName());
+        }
+        CardinalToken last = tokens.get(pos - 1);
+        return new IrStmt.Exports(names, self, start.spanTo(last));
+    }
+
+    /**
+     * Parses the {@code .{entry, entry, ...}} decomposition tail. Each entry is
+     * {@code name} (shorthand: same name in the receiving context) or
+     * {@code name -> alias} (rename: LHS is the name where the symbol already
+     * lives, RHS is its name here — the arrow reads "becomes", uniformly with
+     * match arms and function bodies).
+     */
+    private List<IrStmt.RequireEntry> parseDotBraceEntryList() throws ParseException {
+        expect(CardinalToken.Kind.DOT);
+        expect(CardinalToken.Kind.LBRACE);
+        List<IrStmt.RequireEntry> entries = new ArrayList<>();
+        boolean first = true;
+        while (peek().kind() != CardinalToken.Kind.RBRACE) {
+            if (!first) {
+                expect(CardinalToken.Kind.COMMA);
+            }
+            String remote = expect(CardinalToken.Kind.IDENT).text();
+            String local = remote;
+            if (peek().kind() == CardinalToken.Kind.ARROW) {
+                consume();
+                local = expect(CardinalToken.Kind.IDENT).text();
+            }
+            entries.add(new IrStmt.RequireEntry(remote, local));
+            first = false;
+        }
+        expect(CardinalToken.Kind.RBRACE);
+        return entries;
+    }
+
+    /**
+     * Expression-level by-name decomposition let: {@code let SOURCE.{entry, …}
+     * BODY} — the value consumer of the {@code .{}} payload ({@code requires}
+     * and {@code exports} are the module consumers). Each entry is an
+     * abbreviated let: {@code let p.{name -> u, age} BODY} desugars to
+     * {@code let u = p.name let age = p.age BODY}. By-name reads are
+     * <em>projections</em>, so partial is honest — there is no totality rule
+     * (that's positional-only) — but an unknown key is a lie, rejected when the
+     * source's sort is statically known. Positional keys ({@code _0 …}) are
+     * rejected: tuples are destructure-only.
+     */
+    private IrExpr parseDictDecompositionLetExpr(CardinalToken start, CardinalToken sourceTok)
+            throws ParseException {
+        List<IrStmt.RequireEntry> entries = parseDotBraceEntryList();
+        if (entries.isEmpty()) {
+            throw new ParseException(
+                    "Empty decomposition '.{}' binds nothing", start.origin());
+        }
+        String source = sourceTok.text();
+        boolean scoped = currentScope.containsKey(source);
+        IrSort sourceSort = scoped
+                ? currentScope.get(source)
+                : declaredTopLevelLets.containsKey(source)
+                        ? declaredTopLevelLets.get(source)
+                        : declaredFunctionReturns.get(source);
+        // Params/locals are frame Vars; top-level lets and 0-arg functions
+        // resolve through 0-arg dispatch Calls (the same routing bare
+        // references get in rewriteTopLevelLetAccess).
+        IrExpr sourceRef = scoped
+                ? new IrExpr.Var(source, sourceTok.origin())
+                : (declaredTopLevelLets.containsKey(source)
+                        || declaredFunctionReturns.containsKey(source))
+                        ? new IrExpr.Call(source, List.of(), sourceTok.origin())
+                        : new IrExpr.Var(source, sourceTok.origin());
+        validateDecompositionEntries(entries, sourceSort, source, start);
+
+        // Bind the locals for body parsing; restore the scope afterwards.
+        Map<String, IrSort> shadowed = new LinkedHashMap<>();
+        java.util.Set<String> introduced = new java.util.LinkedHashSet<>();
+        for (IrStmt.RequireEntry entry : entries) {
+            if (currentScope.containsKey(entry.localName())) {
+                shadowed.put(entry.localName(), currentScope.get(entry.localName()));
+            } else {
+                introduced.add(entry.localName());
+            }
+            currentScope.put(entry.localName(), memberSortFor(sourceSort, entry.remoteName()));
+        }
+        IrExpr body;
+        try {
+            body = parseExpr();
+        } finally {
+            for (IrStmt.RequireEntry entry : entries) {
+                if (introduced.contains(entry.localName())) {
+                    currentScope.remove(entry.localName());
+                } else {
+                    currentScope.put(entry.localName(), shadowed.get(entry.localName()));
+                }
+            }
+        }
+        // Wrap in reverse so the first entry becomes the outermost let.
+        IrExpr result = body;
+        for (int i = entries.size() - 1; i >= 0; i--) {
+            IrStmt.RequireEntry entry = entries.get(i);
+            result = new IrExpr.LetIn(
+                    entry.localName(),
+                    memberSortFor(sourceSort, entry.remoteName()),
+                    new IrExpr.FieldAccess(sourceRef, entry.remoteName(), start.origin()),
+                    result,
+                    start.origin());
+        }
+        return result;
+    }
+
+    /**
+     * Top-level by-name decomposition let: {@code let SOURCE.{entry, …}} — one
+     * 0-arg accessor declaration per binder reading {@code SOURCE.key} (the
+     * by-name twin of the positional top-level destructure; no match wrapper
+     * needed — a by-name projection is honest-partial, and key existence is the
+     * only obligation, checked statically when the source's sort is known).
+     */
+    private IrStmt parseDictDecompositionLetTop(CardinalToken start, String source)
+            throws ParseException {
+        List<IrStmt.RequireEntry> entries = parseDotBraceEntryList();
+        if (entries.isEmpty()) {
+            throw new ParseException(
+                    "Empty decomposition '.{}' binds nothing", start.origin());
+        }
+        IrSort sourceSort = declaredTopLevelLets.containsKey(source)
+                ? declaredTopLevelLets.get(source)
+                : declaredFunctionReturns.get(source);
+        if (sourceSort == null) {
+            throw new ParseException(
+                    "Decomposition source '" + source
+                            + "' is not a declared let or 0-arg function",
+                    start.origin());
+        }
+        validateDecompositionEntries(entries, sourceSort, source, start);
+        IrStmt first = null;
+        for (IrStmt.RequireEntry entry : entries) {
+            IrSort memberSort = memberSortFor(sourceSort, entry.remoteName());
+            IrExpr accessor = new IrExpr.FieldAccess(
+                    new IrExpr.Call(source, List.of(), start.origin()),
+                    entry.remoteName(), start.origin());
+            declaredTopLevelLets.put(entry.localName(), memberSort);
+            IrStmt decl = new IrStmt.FunctionDecl(
+                    entry.localName(), List.of(), memberSort, accessor, start.origin(), true);
+            if (first == null) {
+                first = decl;
+            } else {
+                pendingTopLevelDecls.add(decl);
+            }
+        }
+        return first;
+    }
+
+    /** The source's member sort for {@code key}, or the {@code "_"} placeholder. */
+    private static IrSort memberSortFor(IrSort sourceSort, String key) {
+        if (sourceSort instanceof IrSort.Structural ss) {
+            IrSort member = ss.members().get(key);
+            if (member != null) return member;
+        }
+        return IrSort.named("_");
+    }
+
+    /**
+     * Honesty checks shared by both decomposition-let levels: positional keys
+     * (and tuple sources) are destructure-only; an unknown key against a
+     * statically-known structural source is a lie; duplicate local binders
+     * collide.
+     */
+    private void validateDecompositionEntries(
+            List<IrStmt.RequireEntry> entries, IrSort sourceSort, String source, CardinalToken start)
+            throws ParseException {
+        boolean tupleSource = sourceSort instanceof IrSort.Structural ss
+                && TUPLE_SENTINEL.equals(ss.name());
+        java.util.Set<String> locals = new java.util.HashSet<>();
+        for (IrStmt.RequireEntry entry : entries) {
+            if (tupleSource || isPositionalKey(entry.remoteName())) {
+                throw new ParseException(
+                        "Tuple components are destructure-only — use a positional pattern "
+                                + "`let [(a, _, ...)] = " + source
+                                + "` instead of by-name decomposition",
+                        start.origin());
+            }
+            if (sourceSort instanceof IrSort.Structural ss
+                    && !ss.members().containsKey(entry.remoteName())) {
+                throw new ParseException(
+                        "'" + source + "' has no member '" + entry.remoteName()
+                                + "'; available: " + ss.members().keySet(),
+                        start.origin());
+            }
+            if (!locals.add(entry.localName())) {
+                throw new ParseException(
+                        "Duplicate binder '" + entry.localName() + "' in decomposition",
+                        start.origin());
+            }
+        }
+    }
+
+    // --- Function declarations ---
+    // Form: `function NAME(PARAMS):RETURN_SORT [-> BODY]`
+    //   - NAME may be dotted (e.g., `Point.manhattan`) — the whole dotted form
+    //     becomes the dispatch identifier.
+    //   - PARAMS is a comma-separated list of `name:Sort`.
+    //   - If `-> BODY` is present, BODY is used directly.
+    //   - If absent, body synthesis is attempted from the return sort: a return
+    //     of shape `[Sort:@==EXPR]` (which is what the implicit @==EXPR sugar
+    //     produces) yields BODY = EXPR. A return that doesn't pin a value
+    //     (a plain base/struct sort, a range like `[Int:@>=0]`, or a
+    //     self-referential `@==EXPR(@)`) can't synthesize a body and is a
+    //     hard error at the declaration — see specOnlyWithoutSynthesis.
+
+    private IrStmt parseFunction() throws ParseException {
+        CardinalToken start = expectKeyword("function");
+        String name = parseDeclarationName();
+        // Optional `[type E, …]` type-parameter slot (docs/type-parameters.md
+        // §2.1), after the name and before the value params. A bare `[` here is
+        // the slot; value params follow in `(…)`.
+        Map<String, IrSort> typeParams = peek().kind() == CardinalToken.Kind.LBRACKET
+                ? parseTypeParamSlot()
+                : new LinkedHashMap<>();
+        expect(CardinalToken.Kind.LPAREN);
+        List<IrParam> params = parseParamList(CardinalToken.Kind.RPAREN);
+        expect(CardinalToken.Kind.RPAREN);
+        List<ParamDestructure> destrs = drainParamDestructures();
+        List<ParamConversion> convs = drainParamConversions();
+        // Inline destructuring (docs/type-parameters.md §2.4): a bare unknown name
+        // appearing as a TYPE ARGUMENT in a param sort (`b:Box[T]`) introduces a
+        // type variable, merged into the slot params so it scopes identically.
+        // (A top-level param name like `y:E` is NOT collected — an unknown sort
+        // there is a typo, not a binder.)
+        for (IrParam p : params) collectInlineTypeVars(p.sort(), typeParams);
+        // A bare-operator function is a binary operator — exactly two operands
+        // (left, right). The legacy `Type.op` form is naturally binary too
+        // (receiver + one param), so this only guards the new bare form.
+        if (OVERLOADABLE_OPS.contains(name) && params.size() != 2) {
+            throw new ParseException(
+                    "operator '" + name + "' must take exactly 2 parameters (left, right); got "
+                            + params.size(),
+                    start.origin());
+        }
+        expect(CardinalToken.Kind.COLON);
+        ReturnClause rc = parseReturnClause();
+        IrSort returnSort = rc.sort();
+
+        if (peek().kind() == CardinalToken.Kind.ARROW) {
+            consume();
+            // Push function params into scope so match arms can infer contextual
+            // base from `match paramName`. Body parses inside this scope.
+            Map<String, IrSort> savedScope = new LinkedHashMap<>(currentScope);
+            currentScope.clear();
+            for (IrParam p : params) currentScope.put(p.name(), p.sort());
+            // A conversion param's name is its CODOMAIN inside the body (not the
+            // domain contract sort), so the body resolves `bar.<field>` etc.
+            for (ParamConversion c : convs) currentScope.put(c.paramName(), paramConversionCodomain(c));
+            bindParamDestructures(destrs);
+            try {
+                IrExpr body = wrapParamConversions(applyReturnClause(
+                        wrapParamDestructures(parseExpr(), destrs), rc.transform()), convs);
+                declaredFunctionReturns.put(name, returnSort);
+                if (params.isEmpty()) declaredZeroArgFunctions.add(name);
+                if (!typeParams.isEmpty()) {
+                    declaredGenericSignatures.put(name,
+                            new GenericSignature(params, new ArrayList<>(typeParams.keySet())));
+                }
+                return new IrStmt.FunctionDecl(
+                        name, params, returnSort, body, start.origin(), false, typeParams);
+            } finally {
+                currentScope.clear();
+                currentScope.putAll(savedScope);
+            }
+        }
+        // No body: a function terminated without a `-> body` IS a synthesis request
+        // when its return sort pins a value — synthesis is a consequence of the
+        // definition, not a separate directive. `;` is now just an optional terminator.
+        if (peek().kind() == CardinalToken.Kind.SEMICOLON) consume();
+        IrExpr derived = tryDeriveBodyFromReturnSort(returnSort);
+        if (derived != null) {
+            // The synthesized body references destructured params (S4) and
+            // conversion params, so wrap it in both bindings.
+            IrExpr body = wrapParamConversions(wrapParamDestructures(derived, destrs), convs);
+            IrSort effReturn = effectiveSynthesizedReturn(derived, returnSort);
+            declaredFunctionReturns.put(name, effReturn);
+            if (params.isEmpty()) declaredZeroArgFunctions.add(name);
+            return new IrStmt.FunctionDecl(
+                    name, params, effReturn, body, start.origin(), false, typeParams);
+        }
+        throw specOnlyWithoutSynthesis("function", name, returnSort, start.origin());
+    }
+
+    /** Monotonic counter making each lowered action's synthetic key unique. */
+    private int actionSeq = 0;
+
+    /**
+     * The event-reaction declaration (docs/events.md, the Action leg):
+     * {@code action NAME(e:EventSort) -> BODY}. An Action is a one-parameter function
+     * invoked <b>reactively</b> — the event is the sole parameter, its sort is the
+     * match-filter (tested against each emitted event by {@code Refinements.satisfies}),
+     * and the body is the for-effect reaction (its value discarded, like {@code emit}).
+     * The name is <b>diagnostic-only</b> — an Action is never called by name.
+     *
+     * <p>Lowered, like a {@code cast} (see {@code IrCompiler.lowerCoercions}), to an
+     * ordinary {@link IrStmt.FunctionDecl} under a reserved, non-lexable {@code #action#}
+     * key, so every downstream pass (alias / method-op / promotions / gate / sort check /
+     * event guard) handles it uniformly; the compile loop recognises the prefix and
+     * registers it in the module's action table. The return sort is the universal
+     * {@code _} — the reaction body is unconstrained.
+     */
+    private IrStmt parseAction() throws ParseException {
+        CardinalToken start = expectKeyword("action");
+        String name = parseDeclarationName();
+        expect(CardinalToken.Kind.LPAREN);
+        List<IrParam> params = parseParamList(CardinalToken.Kind.RPAREN);
+        expect(CardinalToken.Kind.RPAREN);
+        List<ParamDestructure> destrs = drainParamDestructures();
+        List<ParamConversion> convs = drainParamConversions();
+        if (params.size() != 1) {
+            throw new ParseException(
+                    "an action reacts to exactly one event — declare a single parameter "
+                            + "(the event it matches); got " + params.size(),
+                    start.origin());
+        }
+        if (!convs.isEmpty()) {
+            throw new ParseException(
+                    "an action's event parameter cannot be a conversion", start.origin());
+        }
+        expect(CardinalToken.Kind.ARROW);
+        // Scope the event parameter into the body, mirroring parseFunction.
+        Map<String, IrSort> savedScope = new LinkedHashMap<>(currentScope);
+        currentScope.clear();
+        for (IrParam p : params) currentScope.put(p.name(), p.sort());
+        bindParamDestructures(destrs);
+        try {
+            IrExpr body = wrapParamDestructures(parseExpr(), destrs);
+            String key = "#action#" + (actionSeq++) + "#" + name;
+            return new IrStmt.FunctionDecl(key, params, IrSort.named("_"), body, start.origin());
+        } finally {
+            currentScope.clear();
+            currentScope.putAll(savedScope);
+        }
+    }
+
+    /** Monotonic counter making each lowered conduit's synthetic keys unique. */
+    private int conduitSeq = 0;
+
+    /**
+     * True only while parsing a conductor handler body — enables {@code this.field = expr}
+     * assignment to the conductor's mutable single-owner state. Mutation is a conductor-only
+     * capability (docs/orchestration.md); everywhere else the language is immutable, so the
+     * assignment form is not even recognized outside this context.
+     */
+    private boolean inConductorHandler = false;
+
+    /**
+     * The stateful-fold declaration (docs/reactive-gui.md, the Conduit leg):
+     * {@code conduit NAME(e:E, s:S):{R, S} from INIT -> BODY}. A conduit is a {@code scan}
+     * over the temporal stream of a type's events, sitting BETWEEN {@code emit} and the
+     * actions: on each emitted E (or subtype) it folds the current state S with the event,
+     * yielding a {@code {R, S'}} tuple — R dispatched onward to the actions, S' threaded to
+     * the next event. {@code from INIT} is the seed state. The name is diagnostic-only.
+     *
+     * <p>The dispatched slot R must be the SAME event type as the incoming event (transform the
+     * data, not the type; or return {@code Nothing} to drop it) — enforced at fold time. The
+     * single-return sugar {@code :S} means "pass the event through UNCHANGED, return just the new
+     * state" and desugars HERE to {@code {e, BODY}} (the event param, then BODY as the state) — BODY
+     * appears once, no double-evaluation. The sugar-vs-explicit fork is read from the parsed return
+     * sort: a {@code "_tuple"} {@link IrSort.Structural} with positional members {@code _0}/{@code _1}
+     * is the explicit {@code {E, S}} form; anything else is the {@code :S} sugar.
+     *
+     * <p>Lowered — mirroring {@code action} — to TWO ordinary {@link IrStmt.FunctionDecl}s
+     * under reserved, non-lexable keys sharing a {@code SEQ#NAME} suffix: the fold
+     * ({@code #conduit#…}, params {@code (e, s)}, return {@code {R, S}}, body BODY) and its
+     * init ({@code #conduit-init#…}, 0-arg, return {@code S}, body INIT). The init rides the
+     * {@code pendingTopLevelDecls} channel (the same seam a destructuring let uses to emit
+     * more than one statement); the compile loop pairs the two legs and registers a
+     * CompiledConduit keyed by the event type's bare name.
+     */
+    private IrStmt parseConduit() throws ParseException {
+        CardinalToken start = expectKeyword("conduit");
+        String name = parseDeclarationName();
+        expect(CardinalToken.Kind.LPAREN);
+        List<IrParam> params = parseParamList(CardinalToken.Kind.RPAREN);
+        expect(CardinalToken.Kind.RPAREN);
+        List<ParamDestructure> destrs = drainParamDestructures();
+        List<ParamConversion> convs = drainParamConversions();
+        if (params.size() != 2) {
+            throw new ParseException(
+                    "a conduit folds an event into state — declare exactly two parameters "
+                            + "(the event e:E and the state s:S); got " + params.size(),
+                    start.origin());
+        }
+        if (!convs.isEmpty()) {
+            throw new ParseException(
+                    "a conduit's parameters cannot be conversions", start.origin());
+        }
+        expect(CardinalToken.Kind.COLON);
+        IrSort returnSort = parseSort();
+        // `from` is a CONTEXTUAL keyword (an IDENT whose text is "from"), not a globally
+        // reserved word — so it never collides with a user identifier used elsewhere.
+        CardinalToken fromTok = peek();
+        if (fromTok.kind() != CardinalToken.Kind.IDENT || !fromTok.text().equals("from")) {
+            throw new ParseException(
+                    "a conduit needs a seed — `:{R, S} from INIT -> BODY`; expected `from`, got "
+                            + fromTok.kind() + " '" + fromTok.text() + "'",
+                    fromTok.origin());
+        }
+        consume();  // from
+        // INIT is the seed expression — no e/s in scope (the state has no prior value yet).
+        // The Pratt expression loop consumes only OP tokens, so it stops at the trailing
+        // top-level `->` (an ARROW, not an OP) rather than reading `INIT -> BODY` as a lambda.
+        // A constructor-call / struct-literal seed (the common case) parses cleanly; a truly
+        // complex seed can be parenthesised.
+        IrExpr init = parseExpr();
+        expect(CardinalToken.Kind.ARROW);
+
+        boolean explicit = returnSort instanceof IrSort.Structural st
+                && TUPLE_SENTINEL.equals(st.name())
+                && st.members().containsKey("_0") && st.members().containsKey("_1");
+        IrSort eventSort = params.get(0).sort();
+        IrSort stateSort = explicit
+                ? ((IrSort.Structural) returnSort).members().get("_1")
+                : returnSort;
+        // The dispatched slot must be the SAME event type — a conduit transforms an event's DATA (or
+        // drops it via Nothing), never its TYPE; to change type, re-emit (docs/reactive-gui.md). So
+        // the fold return is {E, S}. The `:S` sugar means "pass the event through UNCHANGED, return
+        // just the new state" → {e, BODY}; the explicit {E, S} form is for transforming the event's
+        // data or returning Nothing to drop it. Same-type / drop is enforced at fold time.
+        IrSort foldReturnSort = explicit
+                ? returnSort
+                : tupleSortOf(eventSort, stateSort, start.origin());
+
+        // BODY sees e and s (the params), mirroring parseAction's body scoping.
+        Map<String, IrSort> savedScope = new LinkedHashMap<>(currentScope);
+        currentScope.clear();
+        for (IrParam p : params) currentScope.put(p.name(), p.sort());
+        bindParamDestructures(destrs);
+        IrExpr body;
+        try {
+            body = wrapParamDestructures(parseExpr(), destrs);
+        } finally {
+            currentScope.clear();
+            currentScope.putAll(savedScope);
+        }
+
+        // `:S` sugar → {e, BODY}: the event passes through unchanged (slot R), BODY is the new state
+        // (slot S). BODY appears exactly once, so there is no double-evaluation.
+        IrExpr foldBody = explicit
+                ? body
+                : buildTupleLiteral(List.of(
+                        new IrExpr.Var(params.get(0).name(), start.origin()), body), start.origin());
+
+        String suffix = (conduitSeq++) + "#" + name;
+        pendingTopLevelDecls.add(new IrStmt.FunctionDecl(
+                "#conduit-init#" + suffix, List.of(), stateSort, init, start.origin()));
+        return new IrStmt.FunctionDecl(
+                "#conduit#" + suffix, params, foldReturnSort, foldBody, start.origin());
+    }
+
+    /** A {@code {a, b}} tuple SORT — a {@code "_tuple"} Structural with members {@code _0}/{@code _1}. */
+    private IrSort tupleSortOf(IrSort a, IrSort b, Origin origin) {
+        Map<String, IrSort> members = new LinkedHashMap<>();
+        members.put("_0", a);
+        members.put("_1", b);
+        return new IrSort.Structural(TUPLE_SENTINEL, members, origin);
+    }
+
+    /**
+     * Parses a user-defined coercion: {@code cast Target:(name:Source) -> body}.
+     * Target-first (mirroring the cast invocation {@code (Target:value)}), then a
+     * single paren'd source binder, then {@code -> body}. The body parses with the
+     * binder in scope (so it can read the source value's fields / match on it,
+     * exactly as a function body sees its params). Only structural malformations are
+     * rejected here; the semantic rules (no primitive↔primitive, orphan, one-per-pair)
+     * are {@code CoercionCheck}'s job. The target may be a refinement sort
+     * ({@code cast [Int:@>0]:(n:Int) -> …}).
+     */
+    private IrStmt parseCoercion() throws ParseException {
+        CardinalToken start = expectKeyword("cast");
+        IrSort targetSort = parseSort();
+        expect(CardinalToken.Kind.COLON);
+        expect(CardinalToken.Kind.LPAREN);
+        CardinalToken paramName = expect(CardinalToken.Kind.IDENT);
+        expect(CardinalToken.Kind.COLON);
+        IrSort sourceSort = parseSort();
+        if (peek().kind() == CardinalToken.Kind.COMMA) {
+            throw new ParseException(
+                    "a coercion takes exactly one source binder — `cast Target:(name:Source) -> …`",
+                    peek().origin());
+        }
+        expect(CardinalToken.Kind.RPAREN);
+        expect(CardinalToken.Kind.ARROW);
+        // The source binder scopes the body — a closed clause, like a fragment.
+        IrExpr body = parseClauseBody(
+                List.of(new IrParam(paramName.text(), sourceSort)), null, true);
+        return new IrStmt.Coercion(
+                sourceSort, targetSort, paramName.text(), body, start.origin());
+    }
+
+    /**
+     * Parse a clause's PRODUCTION — the body expression after {@code ->} — with the
+     * clause's binders installed in scope, restoring scope afterward (docs/arrows.md).
+     * The shared core every value-producing arrow clause performs identically today:
+     * fragment, instance cast, and (eligible to follow) function/method bodies.
+     * {@code freshScope == true} is a CLOSED clause — scope becomes just the binders
+     * (fragment, cast); {@code false} is an OPEN clause — the binders augment the
+     * enclosing scope (a match arm sees its function's params). {@code destrs} may be
+     * null/empty.
+     */
+    private IrExpr parseClauseBody(
+            List<IrParam> binders, List<ParamDestructure> destrs, boolean freshScope)
+            throws ParseException {
+        Map<String, IrSort> savedScope = new LinkedHashMap<>(currentScope);
+        if (freshScope) currentScope.clear();
+        for (IrParam p : binders) currentScope.put(p.name(), p.sort());
+        boolean hasDestrs = destrs != null && !destrs.isEmpty();
+        if (hasDestrs) bindParamDestructures(destrs);
+        try {
+            IrExpr body = parseExpr();
+            return hasDestrs ? wrapParamDestructures(body, destrs) : body;
+        } finally {
+            currentScope.clear();
+            currentScope.putAll(savedScope);
+        }
+    }
+
+    /**
+     * A return-position sort, plus an optional <em>return-type-as-transform</em>
+     * (docs/arrows.md "The unified clause-chain", S2). When the return sort is a
+     * clause-chain {@code :[A -> @… -> B]}, the chain is parsed as a one-input
+     * Lambda ({@code transform}) and the gate-visible return sort is its terminus
+     * type ({@code B}); {@link #applyReturnClause} wraps the body so the chain
+     * CONVERTS the body's result. Otherwise {@code transform} is null and the sort
+     * is parsed normally.
+     */
+    private record ReturnClause(IrSort sort, IrExpr.Lambda transform) {}
+
+    private ReturnClause parseReturnClause() throws ParseException {
+        if (looksLikeClauseChain()) {
+            IrExpr.Lambda chain = asLambda(parseClauseStages());
+            return new ReturnClause(chain.returnSort(), chain);
+        }
+        return new ReturnClause(parseSort(), null);
+    }
+
+    /** Apply a return-clause transform to a body result (no-op when absent). */
+    private static IrExpr applyReturnClause(IrExpr body, IrExpr.Lambda transform) {
+        return transform == null
+                ? body
+                : new IrExpr.Apply(transform, List.of(body), body.origin());
+    }
+
+    /**
+     * A body-less {@code function}/{@code method} whose return sort doesn't
+     * pin a single value can't have its body synthesized (that would be
+     * genuine program search, not desugar — deferred). Rather than silently
+     * dropping the declaration (which made it look defined, skipped
+     * sort-checking of its signature, and surfaced later as a misleading
+     * "Unknown function"), reject it at the declaration site.
+     */
+    private static ParseException specOnlyWithoutSynthesis(
+            String kind, String name, IrSort returnSort, Origin origin) {
+        return new ParseException(
+                kind + " '" + name + "' has no body, and its return type "
+                        + describeSort(returnSort)
+                        + " doesn't pin a value to synthesize one. Add a '-> body', or give a "
+                        + "value-pinning return like [Int:@==EXPR].",
+                origin);
+    }
+
+    /** A short, user-facing rendering of a sort for diagnostics. */
+    /**
+     * Method declaration: {@code method Type.name(params):RetSort [-> body]}.
+     * Desugars to {@code function Type.name(self:Type, params):RetSort [-> body]}.
+     *
+     * <p>The receiver is bound to the name {@code self} (always). Inside the
+     * body and return refinements, {@code self} is a regular in-scope name —
+     * this is a deliberate departure from the old parser, which used {@code @}
+     * to mean the receiver. Under the new design (principle 3), {@code @}
+     * always means the value-under-refinement of the enclosing bracket-form,
+     * and receivers are named explicitly to keep that meaning unambiguous.
+     */
+    private IrStmt parseMethod() throws ParseException {
+        CardinalToken start = expectKeyword("method");
+        String name = parseDeclarationName();
+        int dotIdx = name.indexOf('.');
+        if (dotIdx < 0) {
+            throw new ParseException(
+                    "Method name must be qualified with a receiver type "
+                            + "(e.g. 'Type.name'); got '" + name + "'",
+                    start.origin());
+        }
+        String receiverTypeName = name.substring(0, dotIdx);
+        String memberName = name.substring(dotIdx + 1);
+        // Operators are symmetric multi-dispatch free functions — the
+        // receiver-rooted method form forces the receiver to be the FIRST
+        // operand (you can never write `method Int./(c:Custom)`), exactly the
+        // asymmetry the dispatch unification removes. Reject it and point the
+        // author to the free-function form. Non-operator methods are unaffected.
+        if (OVERLOADABLE_OPS.contains(memberName)) {
+            throw new ParseException(
+                    "operators are free functions, not methods: declare "
+                            + "`function " + memberName + "(a:T, b:T):R` instead of "
+                            + "`method " + receiverTypeName + "." + memberName + "`.",
+                    start.origin());
+        }
+
+        expect(CardinalToken.Kind.LPAREN);
+        List<IrParam> params = parseParamList(CardinalToken.Kind.RPAREN);
+        expect(CardinalToken.Kind.RPAREN);
+        List<ParamDestructure> destrs = drainParamDestructures();
+        List<ParamConversion> convs = drainParamConversions();
+        expect(CardinalToken.Kind.COLON);
+        ReturnClause rc = parseReturnClause();
+        IrSort returnSort = rc.sort();
+
+        // Reject a user-declared `this` — would collide with the injected one.
+        for (IrParam p : params) {
+            if (p.name().equals("this")) {
+                throw new ParseException(
+                        "Method param cannot be named 'this' — that name is reserved for "
+                                + "the implicit receiver injected by method desugar",
+                        start.origin());
+            }
+        }
+
+        IrSort receiverSort = new IrSort.Named(receiverTypeName, start.origin());
+        List<IrParam> desugaredParams = new ArrayList<>(params.size() + 1);
+        desugaredParams.add(new IrParam("this", receiverSort));
+        desugaredParams.addAll(params);
+
+        if (peek().kind() != CardinalToken.Kind.ARROW) {
+            // Spec-only: a bodyless method synthesizes from its return sort when that
+            // sort pins a value. `;` is an optional terminator, no longer a directive.
+            if (peek().kind() == CardinalToken.Kind.SEMICOLON) consume();
+            IrExpr derived = tryDeriveBodyFromReturnSort(returnSort);
+            if (derived != null) {
+                IrExpr body = wrapParamConversions(wrapParamDestructures(derived, destrs), convs);
+                IrSort effReturn = effectiveSynthesizedReturn(derived, returnSort);
+                declaredFunctionReturns.put(name, effReturn);
+                return new IrStmt.FunctionDecl(
+                        name, desugaredParams, effReturn, body, start.origin());
+            }
+            throw specOnlyWithoutSynthesis("method", name, returnSort, start.origin());
+        }
+        consume();  // ARROW
+
+        // Push desugared params (including self) into scope for body parsing.
+        Map<String, IrSort> savedScope = new LinkedHashMap<>(currentScope);
+        currentScope.clear();
+        for (IrParam p : desugaredParams) currentScope.put(p.name(), p.sort());
+        // A conversion param's name is its CODOMAIN inside the body (not the contract domain).
+        for (ParamConversion c : convs) currentScope.put(c.paramName(), paramConversionCodomain(c));
+        bindParamDestructures(destrs);
+        try {
+            IrExpr body = wrapParamConversions(applyReturnClause(
+                    wrapParamDestructures(parseExpr(), destrs), rc.transform()), convs);
+            declaredFunctionReturns.put(name, returnSort);
+            return new IrStmt.FunctionDecl(
+                    name, desugaredParams, returnSort, body, start.origin());
+        } finally {
+            currentScope.clear();
+            currentScope.putAll(savedScope);
+        }
+    }
+
+    /**
+     * A param-sort {@code .{}} destructure (`point:[Point.{x, y -> py}]`): the
+     * param keeps the base sort and each entry binds a local to a field read on
+     * the param in the function body. Accumulated by {@link #parseParamList},
+     * drained by the function/method parsers (S4).
+     */
+    private record ParamDestructure(String local, String paramName,
+                                    String fieldName, IrSort fieldSort) {}
+
+    private final List<ParamDestructure> pendingParamDestructures = new ArrayList<>();
+
+    private List<ParamDestructure> drainParamDestructures() {
+        List<ParamDestructure> d = new ArrayList<>(pendingParamDestructures);
+        pendingParamDestructures.clear();
+        return d;
+    }
+
+    /**
+     * A param-side conversion clause (docs/arrows.md — the input mirror of
+     * return-type-as-transform): {@code bar:[A -> B]} means the caller passes an
+     * {@code A} and the binding {@code bar} inside the function is the {@code B} the
+     * clause produces. The argument's CONTRACT sort is the clause's domain (what the
+     * caller passes / dispatch keys on); {@code bar} in the body is the codomain. The
+     * prologue rebinds {@code bar = clause(bar)} — the same apply-to-subject primitive
+     * as a return clause, on the way in. (The destructure/conversion duality made
+     * first-class at the param.)
+     */
+    private record ParamConversion(String paramName, IrExpr.Lambda clause) {}
+
+    private final List<ParamConversion> pendingParamConversions = new ArrayList<>();
+
+    private List<ParamConversion> drainParamConversions() {
+        List<ParamConversion> c = new ArrayList<>(pendingParamConversions);
+        pendingParamConversions.clear();
+        return c;
+    }
+
+    /** The codomain (internal) sort a conversion param's name has in the body. */
+    private static IrSort paramConversionCodomain(ParamConversion c) {
+        return c.clause().returnSort();
+    }
+
+    /** Wraps {@code body} in `let bar = clause(bar)` for each conversion param. */
+    private IrExpr wrapParamConversions(IrExpr body, List<ParamConversion> convs) {
+        IrExpr out = body;
+        for (int i = convs.size() - 1; i >= 0; i--) {
+            ParamConversion c = convs.get(i);
+            out = new IrExpr.LetIn(c.paramName(), c.clause().returnSort(),
+                    new IrExpr.Apply(c.clause(),
+                            List.of(new IrExpr.Var(c.paramName(), body.origin())), body.origin()),
+                    out, body.origin());
+        }
+        return out;
+    }
+
+    /** Binds the destructured locals into the body's scope for parsing. */
+    private void bindParamDestructures(List<ParamDestructure> destrs) {
+        for (ParamDestructure d : destrs) currentScope.put(d.local(), d.fieldSort());
+    }
+
+    /** Wraps {@code body} in `let local = param.field` for each destructure. */
+    private IrExpr wrapParamDestructures(IrExpr body, List<ParamDestructure> destrs) {
+        IrExpr out = body;
+        for (int i = destrs.size() - 1; i >= 0; i--) {
+            ParamDestructure d = destrs.get(i);
+            // A null fieldName marks a DEFERRED cross-module param destructure —
+            // the binding is wrapped post-link by DestructureResolver, which knows
+            // the declared field names. Skip it here (only seed scope).
+            if (d.fieldName() == null) continue;
+            out = new IrExpr.LetIn(d.local(), d.fieldSort(),
+                    new IrExpr.FieldAccess(
+                            new IrExpr.Var(d.paramName(), body.origin()), d.fieldName(), body.origin()),
+                    out, body.origin());
+        }
+        return out;
+    }
+
+    private List<IrParam> parseParamList(CardinalToken.Kind terminator) throws ParseException {
+        List<IrParam> params = new ArrayList<>();
+        boolean first = true;
+        while (peek().kind() != terminator) {
+            if (!first) expect(CardinalToken.Kind.COMMA);
+            CardinalToken name = expect(CardinalToken.Kind.IDENT);
+            expect(CardinalToken.Kind.COLON);
+            IrSort sort;
+            // Param-side conversion clause: `bar:[A -> B]` (or `[A.{a,b} -> B]`) — the
+            // caller passes the DOMAIN A (the contract sort, what dispatch keys on);
+            // inside the function `bar` is the codomain B (the prologue rebinds
+            // `bar = clause(bar)`). The input mirror of return-type-as-transform
+            // (docs/arrows.md). Requires a top-level `->`, so a plain `.{}` destructure
+            // or a Method sort (no arrow) falls through to the branches below.
+            if (looksLikeClause()) {
+                IrExpr.Lambda clause = parseClause();
+                if (clause.params().size() != 1) {
+                    throw new ParseException(
+                            "a conversion-clause param takes exactly one input "
+                                    + "(the value the caller passes); got "
+                                    + clause.params().size(), name.origin());
+                }
+                sort = clause.params().get(0).sort();           // contract = domain
+                pendingParamConversions.add(new ParamConversion(name.text(), clause));
+                params.add(new IrParam(name.text(), sort));
+                first = false;
+                continue;
+            }
+            // Param-sort `.{}` destructure: `point:[Point.{x, y}]` — the param
+            // keeps base sort [Point]; x, y bind to point.x, point.y in the body.
+            if (peek().kind() == CardinalToken.Kind.LBRACKET
+                    && peek(1).kind() == CardinalToken.Kind.IDENT
+                    && peek(2).kind() == CardinalToken.Kind.DOT
+                    && peek(3).kind() == CardinalToken.Kind.LBRACE) {
+                consume();  // [
+                CardinalToken baseTok = expect(CardinalToken.Kind.IDENT);
+                List<IrStmt.RequireEntry> entries = parseDotBraceEntryList();
+                expect(CardinalToken.Kind.RBRACKET);
+                sort = new IrSort.Named(baseTok.text(), baseTok.origin());
+                IrSort.Structural baseStruct = declaredStructShape(baseTok.text());
+                for (IrStmt.RequireEntry e : entries) {
+                    IrSort fieldSort = baseStruct != null
+                            && baseStruct.members().get(e.remoteName()) != null
+                            ? baseStruct.members().get(e.remoteName())
+                            : IrSort.named("_");
+                    pendingParamDestructures.add(new ParamDestructure(
+                            e.localName(), name.text(), e.remoteName(), fieldSort));
+                }
+            } else {
+                sort = parseSort();
+                // Positional param destructure: `tcd:[TractionCD(n, d)]` binds the
+                // fields by position in the body (parity with the `.{}` form and
+                // with match patterns). Only a PURE-BINDER pattern over a declared
+                // struct is wired — a tuple/record type (`[(Int, Int)]`), a
+                // field-sort narrowing (`[Point(x:[Int:@>0])]`), or a nested
+                // pattern is left as an ordinary sort (destructure those with
+                // `match` in the body).
+                if (sort instanceof IrSort.Structural sp) {
+                    IrSort.Structural decl = patternShapeFor(sp.name());
+                    if (decl != null && isPureBinderParamPattern(sp, decl)) {
+                        // A positional struct param IS a destructure pattern, so the
+                        // arity-total rule applies (verdict B) — same rule, same one
+                        // place as the match form. Without this, the too-FEW case
+                        // (`p:[P(a)]` over a 2-field struct) slipped through (the
+                        // match form caught too-many but the param form caught
+                        // neither too-few here).
+                        requireArityTotal(sp.name(), sp.members().size(),
+                                decl.constructorMembers().size(), sp.origin());
+                        sort = wirePositionalParamDestructure(name, sp, decl);
+                    } else if (decl == null && isDeferredPattern(sp)) {
+                        // Cross-module positional param destructure `v:[Vec(x, y)]`.
+                        // Field names/order unknown at parse time: seed the binders
+                        // into scope (sort `_`) so the body parses, but leave the
+                        // param sort as the deferred pattern. DestructureResolver
+                        // reduces it to `[Vec]` and wraps the body post-link.
+                        seedDeferredParamBinders(name.text(), sp);
+                    }
+                }
+            }
+            params.add(new IrParam(name.text(), sort));
+            first = false;
+        }
+        return params;
+    }
+
+    /**
+     * True iff {@code sp} (a Structural param sort over the declared struct
+     * {@code decl}) is a <em>pure-binder</em> positional destructure — every
+     * clause is a bare binder (positional or field-named), no field constraint
+     * and no nesting. Detected by reference-identity: the parser reuses the
+     * DECLARED field-sort object for a bare binder, but builds a fresh sort for a
+     * by-name narrowing (`x:[Int:@>0]`) — so a member that <em>is</em> the
+     * declared sort is a binder, and anything else is a narrowing/type. Tuples,
+     * records, narrowing types, and nested patterns are therefore NOT pure-binder
+     * (destructure those with {@code match} in the body).
+     */
+    private boolean isPureBinderParamPattern(IrSort.Structural sp, IrSort.Structural decl) {
+        if (!literalConstrainedFields.getOrDefault(sp, java.util.Set.of()).isEmpty()) {
+            return false;
+        }
+        for (Map.Entry<String, IrSort> m : sp.members().entrySet()) {
+            IrSort declared = decl.members().get(m.getKey());
+            if (declared == null || m.getValue() != declared) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Wires a pure-binder positional param destructure {@code p:[Type(a, b)]}:
+     * emits a {@link ParamDestructure} per field so the body sees
+     * {@code let a = p.field} (reusing the {@code .{}} machinery), and returns the
+     * param's reduced type {@code [Type]}. Caller guarantees pure-binder via
+     * {@link #isPureBinderParamPattern}.
+     */
+    private IrSort wirePositionalParamDestructure(
+            CardinalToken paramName, IrSort.Structural sp, IrSort.Structural decl) {
+        Map<String, String> renames = destructureRenames.getOrDefault(sp, Map.of());
+        for (Map.Entry<String, IrSort> m : sp.members().entrySet()) {
+            String binder = renames.getOrDefault(m.getKey(), m.getKey());
+            pendingParamDestructures.add(new ParamDestructure(
+                    binder, paramName.text(), m.getKey(), m.getValue()));
+        }
+        return new IrSort.Named(sp.name(), paramName.origin());
+    }
+
+    /**
+     * Seeds the binders of a DEFERRED positional param pattern {@code v:[Vec(x,
+     * y)]} into scope so the function body can be parsed. A {@code fieldName} of
+     * {@code null} marks the destructure as DEFERRED: {@link #wrapParamDestructures}
+     * skips it (the field name isn't known yet), and {@code DestructureResolver}
+     * reduces the param sort and wraps the body post-link. Nested patterns are
+     * destructured by the resolver via the param sort, so only the top-level
+     * slots are seeded here (matching how the local pure-binder form behaves).
+     */
+    private void seedDeferredParamBinders(String paramName, IrSort.Structural sp) {
+        java.util.Set<String> skip =
+                literalConstrainedFields.getOrDefault(sp, java.util.Set.of());
+        Map<String, String> renames = destructureRenames.getOrDefault(sp, Map.of());
+        for (Map.Entry<String, IrSort> m : sp.members().entrySet()) {
+            if (skip.contains(m.getKey())) continue;          // discard / literal slot
+            if (m.getValue() instanceof IrSort.Structural) continue;  // nested: resolver binds
+            String binder = renames.getOrDefault(m.getKey(), m.getKey());
+            pendingParamDestructures.add(new ParamDestructure(
+                    binder, paramName, null, IrSort.named("_")));
+        }
+    }
+
+    private static String paramSig(List<IrParam> params) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < params.size(); i++) {
+            if (i > 0) sb.append(",");
+            sb.append(params.get(i).name()).append(":").append(params.get(i).sort());
+        }
+        return sb.toString();
+    }
+
+    /**
+     * The synthesized body for a return sort: the EXPR of a top-level
+     * {@code @==EXPR} (@-free) conjunct of its predicate — `[Int:@==n*2]`, or
+     * the `@==r` half of `[Int:@==r & @>0]`. Returns null if no such definition
+     * conjunct exists. The remaining conjuncts are the postcondition the gate
+     * still proves (see {@link #removeDefinitionConjunct}) — so one pin can both
+     * DEFINE the body and carry a property to VERIFY.
+     */
+    private static IrExpr tryDeriveBodyFromReturnSort(IrSort returnSort) {
+        return returnSort instanceof IrSort.Refined r ? definitionWitness(r.predicate()) : null;
+    }
+
+    /** The EXPR of a top-level `@==EXPR` (@-free) conjunct of {@code pred}, or null. */
+    private static IrExpr definitionWitness(IrExpr pred) {
+        if (!(pred instanceof IrExpr.BinOp bop)) return null;
+        if (bop.op() == IrExpr.Op.EQ) {
+            // Accept either side: `@==EXPR` (the sugar's shape) or a flipped form.
+            IrExpr candidate;
+            if (bop.left() instanceof IrExpr.SelfRef && !(bop.right() instanceof IrExpr.SelfRef)) {
+                candidate = bop.right();
+            } else if (bop.right() instanceof IrExpr.SelfRef && !(bop.left() instanceof IrExpr.SelfRef)) {
+                candidate = bop.left();
+            } else {
+                return null;
+            }
+            return containsSelfRef(candidate) ? null : candidate;
+        }
+        if (bop.op() == IrExpr.Op.AND) {
+            IrExpr l = definitionWitness(bop.left());
+            return l != null ? l : definitionWitness(bop.right());
+        }
+        return null;
+    }
+
+    /** True if {@code pred} is a `@==EXPR` definition conjunct (one side `@`, other @-free). */
+    private static boolean isDefinitionPin(IrExpr pred) {
+        return pred instanceof IrExpr.BinOp b && b.op() == IrExpr.Op.EQ
+                && ((b.left() instanceof IrExpr.SelfRef && !containsSelfRef(b.right()))
+                || (b.right() instanceof IrExpr.SelfRef && !containsSelfRef(b.left())));
+    }
+
+    /**
+     * {@code pred} with its `@==EXPR` definition conjunct removed — the residual
+     * is the postcondition the gate must prove. Null when the predicate is
+     * nothing but the definition (a pure synthesis pin, no postcondition).
+     */
+    private static IrExpr removeDefinitionConjunct(IrExpr pred) {
+        if (isDefinitionPin(pred)) return null;
+        if (pred instanceof IrExpr.BinOp bop && bop.op() == IrExpr.Op.AND) {
+            IrExpr l = removeDefinitionConjunct(bop.left());
+            IrExpr r = removeDefinitionConjunct(bop.right());
+            if (l == null) return r;
+            if (r == null) return l;
+            return new IrExpr.BinOp(IrExpr.Op.AND, l, r, bop.origin());
+        }
+        return pred;
+    }
+
+    /**
+     * The declared return for a synthesized body — the postcondition the gate
+     * still proves, with the definition consumed.
+     * <ul>
+     *   <li>{@code @==witness & POSTCOND} → {@code [base:POSTCOND]}: the witness
+     *       is the body (DEFINE), POSTCOND is proven (VERIFY) — one pin, both.</li>
+     *   <li>A pure construction- or pipeline-pin (Record / let-chain body) is
+     *       DEFINITIONAL — the body IS the construction, and it carries opaque
+     *       calls the gate can't reflexively prove — so declare the bare base.</li>
+     *   <li>A pure value pin ({@code @==n*2}) keeps its refinement — the gate
+     *       proves it reflexively.</li>
+     * </ul>
+     */
+    private static IrSort effectiveSynthesizedReturn(IrExpr derived, IrSort declaredReturn) {
+        if (declaredReturn instanceof IrSort.Refined r) {
+            IrExpr residual = removeDefinitionConjunct(r.predicate());
+            if (residual != null) {
+                return new IrSort.Refined(r.name(), residual, r.origin());  // postcondition to prove
+            }
+        }
+        if (derived instanceof IrExpr.Record rec && rec.typeName() != null) {
+            return new IrSort.Named(rec.typeName(), declaredReturn.origin());
+        }
+        if (derived instanceof IrExpr.LetIn && declaredReturn instanceof IrSort.Refined r) {
+            return new IrSort.Named(r.name(), declaredReturn.origin());
+        }
+        return declaredReturn;
+    }
+
+    /**
+     * S6 merge: build a {@code Target(…)} construction from a partial
+     * {@code value} (a different struct supplying some fields) plus the pin's
+     * {@code @.f == EXPR} field-values. Each target field comes from the pin if
+     * pinned, else a field read on the value, else it's an unspecified-field
+     * error (fabricate-never — the merge must cover every field).
+     */
+    private IrExpr mergePartialWithPin(
+            IrExpr value, String targetName, IrSort.Structural target,
+            IrSort.Structural valueStruct, IrExpr pin, sibarum.cardinal.core.Origin origin)
+            throws ParseException {
+        Map<String, IrExpr> pinValues = new LinkedHashMap<>();
+        collectFieldPins(pin, pinValues);
+        Map<String, IrExpr> members = new LinkedHashMap<>();
+        for (String f : target.constructorMembers().keySet()) {
+            if (pinValues.containsKey(f)) {
+                members.put(f, pinValues.get(f));
+            } else if (valueStruct != null && valueStruct.members().containsKey(f)) {
+                members.put(f, new IrExpr.FieldAccess(value, f, origin));
+            } else {
+                throw new ParseException(
+                        "promotion to '" + targetName + "' leaves field '" + f
+                                + "' unspecified — the value supplies "
+                                + (valueStruct != null ? valueStruct.members().keySet() : "(non-struct)")
+                                + " and the pin supplies " + pinValues.keySet(),
+                        origin);
+            }
+        }
+        return new IrExpr.Record(targetName, members, origin);
+    }
+
+    /** Collects {@code @.field == EXPR} conjuncts of a pin as field -> EXPR. */
+    private static void collectFieldPins(IrExpr pred, Map<String, IrExpr> out) {
+        if (pred instanceof IrExpr.BinOp op) {
+            switch (op.op()) {
+                case AND -> {
+                    collectFieldPins(op.left(), out);
+                    collectFieldPins(op.right(), out);
+                }
+                case EQ -> {
+                    String lf = pinFieldName(op.left());
+                    if (lf != null) { out.put(lf, op.right()); return; }
+                    String rf = pinFieldName(op.right());
+                    if (rf != null) out.put(rf, op.left());
+                }
+                default -> { }
+            }
+        }
+    }
+
+    private static String pinFieldName(IrExpr e) {
+        return e instanceof IrExpr.FieldAccess fa && fa.base() instanceof IrExpr.SelfRef
+                ? fa.fieldName() : null;
+    }
+
+    /** True if {@code expr} contains an {@link IrExpr.SelfRef} anywhere. */
+    private static boolean containsSelfRef(IrExpr expr) {
+        return switch (expr) {
+            case IrExpr.SelfRef s -> true;
+            case IrExpr.Lit l -> false;
+            case IrExpr.Dec d -> false;
+            case IrExpr.Chr c -> false;
+            case IrExpr.Str s -> false;
+            case IrExpr.Bool b -> false;
+            case IrExpr.Var v -> false;
+            case IrExpr.DispatchRef d -> false;
+            case IrExpr.BinOp op -> containsSelfRef(op.left()) || containsSelfRef(op.right());
+            case IrExpr.LetIn l -> containsSelfRef(l.value()) || containsSelfRef(l.body());
+            case IrExpr.Call c -> c.args().stream().anyMatch(CardinalParser::containsSelfRef);
+            case IrExpr.Lambda lam -> containsSelfRef(lam.body());
+            case IrExpr.Apply app -> containsSelfRef(app.fn())
+                    || app.args().stream().anyMatch(CardinalParser::containsSelfRef);
+            case IrExpr.Match m -> containsSelfRef(m.scrutinee())
+                    || m.branches().stream().anyMatch(b -> containsSelfRef(b.result()));
+            case IrExpr.Record r -> r.members().values().stream().anyMatch(CardinalParser::containsSelfRef);
+            case IrExpr.FieldAccess fa -> containsSelfRef(fa.base());
+            case IrExpr.MethodCall mc -> containsSelfRef(mc.receiver())
+                    || mc.args().stream().anyMatch(CardinalParser::containsSelfRef);
+            case IrExpr.Iterate it -> containsSelfRef(it.source())
+                    || it.outputs().stream().anyMatch(o -> o.init() != null && containsSelfRef(o.init()))
+                    || it.arms().stream().anyMatch(a -> a.writes().stream().anyMatch(
+                            w -> containsSelfRef(w.value()) || (w.key() != null && containsSelfRef(w.key()))));
+            case IrExpr.Cast cast -> containsSelfRef(cast.value());
+            case IrExpr.Emit em -> containsSelfRef(em.event()) || containsSelfRef(em.body());
+        };
+    }
+
+    /**
+     * Rewrite every {@link IrExpr.SelfRef} in {@code expr} to {@code with} — the
+     * {@code @}→value substitution that lowers a clause-chain conversion stage
+     * (docs/arrows.md "The unified clause-chain"). A chain {@code [A -> @e -> B]}
+     * is a one-input Lambda whose anonymous input is {@code @}; threading the value
+     * through a stage is just replacing {@code @} with the running expression. The
+     * interpreter therefore never meets a chain {@code SelfRef} (its no-runtime-value
+     * invariant holds). Mirrors {@link #containsSelfRef}'s structural walk.
+     */
+    private static IrExpr substituteSelf(IrExpr expr, IrExpr with) {
+        return switch (expr) {
+            case IrExpr.SelfRef s -> with;
+            case IrExpr.Lit l -> l;
+            case IrExpr.Dec d -> d;
+            case IrExpr.Chr c -> c;
+            case IrExpr.Str s -> s;
+            case IrExpr.Bool b -> b;
+            case IrExpr.Var v -> v;
+            case IrExpr.DispatchRef d -> d;
+            case IrExpr.BinOp op -> new IrExpr.BinOp(op.op(),
+                    substituteSelf(op.left(), with), substituteSelf(op.right(), with), op.origin());
+            case IrExpr.LetIn l -> new IrExpr.LetIn(l.name(), l.declaredSort(),
+                    substituteSelf(l.value(), with), substituteSelf(l.body(), with), l.origin(), l.claim());
+            case IrExpr.Call c -> new IrExpr.Call(c.functionName(),
+                    c.args().stream().map(a -> substituteSelf(a, with)).toList(), c.origin());
+            case IrExpr.Lambda lam -> new IrExpr.Lambda(lam.params(), lam.returnSort(),
+                    substituteSelf(lam.body(), with), lam.origin());
+            case IrExpr.Apply app -> new IrExpr.Apply(substituteSelf(app.fn(), with),
+                    app.args().stream().map(a -> substituteSelf(a, with)).toList(), app.origin());
+            case IrExpr.Match m -> new IrExpr.Match(substituteSelf(m.scrutinee(), with),
+                    m.branches().stream().map(b -> new IrExpr.MatchBranch(
+                            b.pattern(), substituteSelf(b.result(), with))).toList(), m.origin());
+            case IrExpr.Record r -> {
+                Map<String, IrExpr> mm = new LinkedHashMap<>();
+                r.members().forEach((k, v) -> mm.put(k, substituteSelf(v, with)));
+                yield new IrExpr.Record(r.typeName(), mm, r.runtimeChecks(), r.origin());
+            }
+            case IrExpr.FieldAccess fa -> new IrExpr.FieldAccess(
+                    substituteSelf(fa.base(), with), fa.fieldName(), fa.origin());
+            case IrExpr.MethodCall mc -> new IrExpr.MethodCall(substituteSelf(mc.receiver(), with),
+                    mc.methodName(), mc.args().stream().map(a -> substituteSelf(a, with)).toList(), mc.origin());
+            case IrExpr.Iterate it -> new IrExpr.Iterate(
+                    substituteSelf(it.source(), with),
+                    it.coSources().stream().map(s -> substituteSelf(s, with)).toList(),
+                    it.element(),
+                    it.outputs().stream().map(o -> new IrExpr.OutputSpec(o.name(), o.kind(),
+                            o.init() == null ? null : substituteSelf(o.init(), with))).toList(),
+                    it.arms().stream().map(a -> new IrExpr.Arm(a.pattern(),
+                            a.writes().stream().map(w -> new IrExpr.Write(w.output(),
+                                    w.key() == null ? null : substituteSelf(w.key(), with),
+                                    substituteSelf(w.value(), with))).toList())).toList(),
+                    it.origin(), it.gpu());
+            case IrExpr.Cast cast -> new IrExpr.Cast(cast.targetSort(),
+                    substituteSelf(cast.value(), with), cast.origin());
+            case IrExpr.Emit em -> new IrExpr.Emit(
+                    substituteSelf(em.event(), with), substituteSelf(em.body(), with), em.origin());
+        };
+    }
+
+    // --- Top-level let ---
+    // Form: `let qualified.name (:Sort)? (= value)?`
+    //
+    // Three cases:
+    //   `let X:Sort = value`  — explicit sort + value.  Sort acts as a
+    //                           sanity-check (its base name must match the
+    //                           inferred value's base name); the binding's
+    //                           effective sort is the value's maximally
+    //                           specific inferred sort (so dispatch routing
+    //                           has the tightest narrowing available).
+    //   `let X = value`        — sort fully inferred from value via
+    //                           {@link #inferMaximalSort}.
+    //   `let X:Sort`           — spec-only.  Stays NoOp pending the proof
+    //                           engine; the qualified-name synthesis path is
+    //                           a separate TODO item.
+    //
+    // Lowering: the first two cases produce {@code IrStmt.FunctionDecl(name,
+    // [], inferredSort, value)} — a 0-arg function in the dispatch table.
+    // Bare references to the let name in expression position are rewritten
+    // to {@code Call(name, [])} (see {@link #parsePrimary}) so users don't
+    // have to write {@code origin()} everywhere.
+
+    private IrStmt parseLet() throws ParseException {
+        CardinalToken start = expectKeyword("let");
+        if (peek().kind() == CardinalToken.Kind.LBRACKET) {
+            return parseDestructuringLetTop(start);
+        }
+        String name = parseDottedName();
+        // A retired parametric-trait form (`let X[type T]:Type{…}`) — consume the
+        // slot so the `:Type{` below reaches the trait-migration error (in
+        // parseSort) rather than a generic one. Traits are now declared with the
+        // `trait` keyword (parseTrait); `let` no longer declares them.
+        if (peek().kind() == CardinalToken.Kind.LBRACKET) parseTypeParamSlot();
+        if (peek().kind() == CardinalToken.Kind.DOT && peek(1).kind() == CardinalToken.Kind.LBRACE) {
+            return parseDictDecompositionLetTop(start, name);
+        }
+        IrSort declaredSort = null;
+        IrExpr value = null;
+        if (peek().kind() == CardinalToken.Kind.COLON) {
+            consume();
+            // A clause after `:` — a fragment / conversion chain (docs/arrows.md).
+            // Unified ascription: with a `= rhs` SUBJECT the clause is APPLIED to it
+            // (the same apply-to-subject primitive as a function return-clause —
+            // `let x:[Int -> @+"" -> String] = 12` ⟹ "12"); with NO subject it binds
+            // the clause itself as a first-class fragment value (a 0-arg let returning
+            // the lambda, sorted as the Method contract). Distinguished from an
+            // ordinary `[…]` sort by a top-level `->` or a named-param head.
+            if (looksLikeClause()) {
+                IrExpr.Lambda frag = parseClause();
+                if (peek().kind() == CardinalToken.Kind.EQUALS) {
+                    consume();
+                    value = applyReturnClause(parseExpr(), frag);
+                    declaredSort = frag.returnSort();
+                } else {
+                    List<IrSort> paramSorts = new ArrayList<>();
+                    List<String> paramNames = new ArrayList<>();
+                    for (IrParam p : frag.params()) {
+                        paramSorts.add(p.sort());
+                        paramNames.add(p.name());
+                    }
+                    IrSort methodSort = new IrSort.CallSig(
+                            IrSort.CallSig.METHOD, paramSorts, paramNames,
+                            frag.returnSort(), start.origin());
+                    declaredTopLevelLets.put(name, methodSort);
+                    if (peek().kind() == CardinalToken.Kind.SEMICOLON) consume();
+                    return new IrStmt.FunctionDecl(
+                            name, List.of(), methodSort, frag, start.origin(), true);
+                }
+            } else if (checkKeyword("Type") && peek(1).kind() == CardinalToken.Kind.LBRACKET) {
+                // `let NAME:Type[sortExpr]` — a reusable sort alias (refinements,
+                // unions of refined bases, named sorts): a type-level declaration with
+                // no value, lowered to a TypeAlias the AliasResolver inlines.
+                consume();  // `Type`
+                IrSort aliased = parseBracketSort();  // the `[...]` (unions/refinements)
+                if (peek().kind() == CardinalToken.Kind.SEMICOLON) {
+                    consume();  // optional declaration terminator
+                }
+                if (peek().kind() == CardinalToken.Kind.EQUALS) {
+                    throw new ParseException(
+                            "let '" + name + "' is a Type[...] sort alias — it declares a "
+                                    + "sort, not a value, so it can't have '= EXPR'",
+                            peek().origin());
+                }
+                types.register(name, new TypeInfo.Alias(aliased));
+                return new IrStmt.TypeAlias(name, aliased, start.origin());
+            } else if (checkKeyword("Type") && peek(1).kind() == CardinalToken.Kind.LBRACE) {
+                // A NAMED trait uses the `trait` declarator, not `let`.
+                throw new ParseException(
+                        "Declare a named trait with `trait " + name + "{ … }` — `let` is a "
+                                + "binding form, not the declarator for traits.",
+                        peek().origin());
+            } else {
+                declaredSort = parseSort();
+            }
+        }
+        if (value == null && peek().kind() == CardinalToken.Kind.EQUALS) {
+            consume();
+            value = parseExpr();
+        }
+        // `;` is now just an optional definition terminator — never a synthesis
+        // directive. Synthesis is a CONSEQUENCE of terminating without a value when
+        // the sort pins one (below), not something `;` requests.
+        if (peek().kind() == CardinalToken.Kind.SEMICOLON) consume();
+        if (declaredSort == null && value == null) {
+            throw new ParseException(
+                    "let '" + name + "' needs either a sort annotation (':Sort') "
+                            + "or a value ('= EXPR')",
+                    start.origin());
+        }
+        // S6: promotion via value synthesis — `let x:[Target:@.f==v] = partial`.
+        // The value (a DIFFERENT struct) supplies the base fields, the pin supplies
+        // the rest, merged into a Target construction. The guard conditions (a refined
+        // STRUCT target whose base differs from the value's) are specific enough that
+        // this can't be confused with a plain coercion, so it fires on structure
+        // alone — no `;` needed. The result IS a Target by construction (definitional),
+        // so the binding becomes the bare struct sort and the base-mismatch check
+        // below sees a match.
+        if (value != null && declaredSort instanceof IrSort.Refined ref
+                && types.isStruct(ref.name())) {
+            String valueBase = baseSortName(inference.maximalSort(value));
+            if (!ref.name().equals(valueBase)) {
+                IrSort.Structural target = declaredStructShape(ref.name());
+                IrSort.Structural valueStruct = valueBase == null
+                        ? null : declaredStructShape(valueBase);
+                value = mergePartialWithPin(
+                        value, ref.name(), target, valueStruct, ref.predicate(), start.origin());
+                declaredSort = new IrSort.Named(ref.name(), declaredSort.origin());
+            }
+        }
+        if (value == null) {
+            // Spec-only let: a value-pinning sort with no `= EXPR` IS the definition.
+            // Terminating without a value synthesizes the pinned value (when the sort
+            // pins one); it is not an error and needs no directive.
+            // The predicate `@==EXPR` carries its witness as an expression, so
+            // the body is synthesized verbatim from the pin (`let
+            // zero:[Decimal:@==0.0]` means zero = 0.0; the claim wrapper below
+            // still notarizes the synthesis at force).
+            value = syntacticPin(declaredSort);
+            // Everything else is the prover's job: a value-pinning or finite-range
+            // refinement is synthesized by ENUMERATING its integer extension and
+            // filtering each candidate through the same membership engine that
+            // guards parameters (see synthesizeFromSort / SynthesisBridge / the
+            // prover's Synthesis). `Stream[Int:P]` → the whole extension; a scalar
+            // `[Int:P]` → its unique witness.
+            if (value == null) value = synthesizeFromSort(declaredSort, start.origin());
+            if (value == null) {
+                // No value and the sort pins nothing synthesizable (e.g. [Int:@>0],
+                // unbounded) — honest error, not a silent NoOp.
+                throw new ParseException(
+                        "let '" + name + "' has no value ('= EXPR') and its sort "
+                                + declaredSort + " does not pin a synthesizable value "
+                                + "(e.g. [Int:0], [Int:@==EXPR], or a finite range "
+                                + "Stream[Int:LO <= @ < HI])",
+                        start.origin());
+            }
+        }
+        IrSort inferredSort = inference.maximalSort(value);
+        // Coercion is a QUERY now, not decided here: the type system says which coercion a declared
+        // claim licenses (docs/language-inventory.md §4) and this let-lowering acts on the verdict —
+        // computing the recorded binding sort and whether the claim travels on a construction-gate
+        // LetIn. The parser no longer re-derives demote/trait/autobox/Int→Decimal itself.
+        //
+        // Slice 1 of the nominal-subtype migration: struct↔struct assignability is answered by the
+        // isolated Assignability engine instead (legality) composed with the inference above (the tight
+        // binding sort). Everything else still routes through the coercion facade below.
+        boolean recordPromotion = false;
+        boolean streamAutobox = false;
+        // The nominal engine (Assignability) decides the binding sort AND legality for the trait-free
+        // cases (roadmap §4.5 item 1 — replacing the retired CoercionResolver); it throws on a provable
+        // mismatch. A null result defers to the aggregate sentinels / declared-claim below (trait cases,
+        // whose satisfaction is a post-link fact, are judged by the construction/claim gate).
+        IrSort binding = inference.nominalBinding(inferredSort, declaredSort, name, start.origin());
+        if (binding == null) {
+            String inferredBase = baseSortName(inferredSort);
+            String declaredBase = baseSortName(declaredSort);
+            if ("_record".equals(inferredBase)) {
+                // Anonymous aggregate: AggregatePromotion stamps + validates it at IR time (the record's
+                // own construction-gate judgment IS the claim check), so no claim LetIn is emitted.
+                recordPromotion = true;
+                binding = declaredSort;
+            } else if ("_tuple".equals(inferredBase) && "Stream".equals(declaredBase)) {
+                // tuple → Stream[T] autobox (§8.6), gated at parse by the element check.
+                String elemError = streamElementError(declaredSort, inferredSort);
+                if (elemError != null) throw new ParseException(elemError, start.origin());
+                streamAutobox = true;
+                binding = declaredSort;
+            } else {
+                // Trait / alias / parametric / undecidable: bind at the declared claim and defer legality
+                // to the post-link gate (which has the trait closure the parser lacks).
+                binding = declaredSort;
+            }
+        }
+        declaredTopLevelLets.put(name, binding);
+        // A declared sort is a claim made where the binding is made. The
+        // 0-arg lowering keeps the tight inferred narrowing as the return
+        // sort; the claim itself travels inside, on a LetIn the construction
+        // gate judges three-way (fit/miss/overlap) like a constructor arg.
+        // The promotion-sugar case is exempt: the stamped record's own
+        // construction gate judgment IS the claim check.
+        IrExpr fnBody = value;
+        if (declaredSort != null && !recordPromotion && !streamAutobox) {
+            fnBody = new IrExpr.LetIn(
+                    name, binding, value,
+                    new IrExpr.Var(name, start.origin()),
+                    start.origin(), declaredSort);
+        }
+        return new IrStmt.FunctionDecl(
+                name, List.of(), binding, fnBody, start.origin(), true);
+    }
+
+    /**
+     * The unique witness a value-pinning refinement carries, or null when
+     * the sort doesn't pin one. Two pin shapes:
+     *
+     * <p><b>Syntactic</b> — {@code Refined(base, @ == EXPR)} (also what the
+     * bare-expr sugar produces: {@code [Decimal:0.0]} ≡
+     * {@code [Decimal:@==0.0]}): the witness is EXPR verbatim, any base,
+     * provided EXPR is closed over {@code @} (a self-referential pin like
+     * {@code @==@+1} has no extractable witness).
+     *
+     * <p><b>Semantic</b> — an Int refinement whose extension the bound
+     * engine collapses to a single point: integer-strict cuts make
+     * {@code [Int:@>-1 & @<1]} the singleton {@code {0}} — discreteness is
+     * the license (a Decimal interval has no such witness; choosing one
+     * would inject information the program never supplied). Sound to be
+     * optimistic here: {@code bound} over-approximates, and the synthesized
+     * binding still carries its claim — the construction gate verifies the
+     * witness against the full predicate (compile-time FITS or a notarized
+     * runtime check), so a wrong witness can never bind silently.
+     */
+    private IrExpr syntacticPin(IrSort sort) {
+        if (!(sort instanceof IrSort.Refined r)) return null;
+        // The one purely-syntactic pin: `@ == EXPR` reads its witness straight off
+        // the predicate (the RHS expression IS the value — no proving involved, so
+        // it legitimately stays here). Any base; EXPR must be closed over `@`.
+        if (r.predicate() instanceof IrExpr.BinOp op
+                && op.op() == IrExpr.Op.EQ
+                && op.left() instanceof IrExpr.SelfRef
+                && !containsSelfRef(op.right())) {
+            return op.right();
+        }
+        return null;
+    }
+
+    /**
+     * Value synthesis delegated to the prover ({@link sibarum.cardinal.ir.SynthesisBridge}
+     * → {@code Synthesis}): the refinement's integer extension, enumerated and filtered
+     * by the SAME membership engine a parameter guard runs. For a {@code Stream[Int:P]}
+     * sort the whole extension is the value (a tuple → autoboxed to a stream); for a
+     * scalar {@code [Int:P]} a UNIQUE survivor is the pinned witness. Returns null when
+     * nothing finite is pinned (the caller raises the honest not-synthesizable error).
+     * No synthesis logic lives here — only the integers-to-IR plumbing.
+     */
+    private IrExpr synthesizeFromSort(IrSort sort, Origin origin) {
+        IrSort elem = streamElementSort(sort);
+        boolean stream = elem != null;
+        IrSort refinement = stream ? elem : sort;
+        java.util.Optional<java.util.List<Long>> extension =
+                sibarum.cardinal.ir.SynthesisBridge.enumerateInt(refinement);
+        if (extension.isEmpty()) return null;
+        java.util.List<Long> values = extension.get();
+        if (stream) {
+            List<IrExpr> elems = new ArrayList<>(values.size());
+            for (long v : values) elems.add(new IrExpr.Lit(v, origin));
+            return buildTupleLiteral(elems, origin);
+        }
+        // A scalar refinement pins a value only when exactly one integer satisfies it.
+        return values.size() == 1 ? new IrExpr.Lit(values.get(0), origin) : null;
+    }
+
+
+    /**
+     * The tuple→{@code Stream[T]} element gate (docs/iteration.md §8.6, lifted from the retired
+     * {@code CoercionResolver}): every member of the tuple must be convertible to {@code T} (exact base,
+     * plus the lossless Int→Decimal embedding). Returns the specific error message, or {@code null} when
+     * every element converts.
+     */
+    private static String streamElementError(IrSort declaredStream, IrSort tupleSort) {
+        IrSort elemType = declaredStream instanceof IrSort.Named sn && !sn.typeArgs().isEmpty()
+                ? sn.typeArgs().get(0) : null;
+        String tBase = elemType == null ? null : baseSortName(elemType);
+        if (tBase == null || !(tupleSort instanceof IrSort.Structural st)) return null;
+        int idx = 0;
+        for (IrSort m : st.members().values()) {
+            String mBase = baseSortName(m);
+            boolean ok = tBase.equals(mBase) || ("Decimal".equals(tBase) && "Int".equals(mBase));
+            if (!ok) {
+                return "Cannot box this tuple as Stream[" + describeSort(elemType) + "]: element "
+                        + idx + " is " + describeSort(m) + ", not " + describeSort(elemType);
+            }
+            idx++;
+        }
+        return null;
+    }
+
+
+    // --- Struct declarations ---
+    // Form: `struct Name(field:Sort, field:Sort, ...)`
+    //
+    // Desugars to an IrStmt.TypeAlias whose aliased sort is an IrSort.Structural.
+    // The struct is also recorded in {@link #types} so that subsequent
+    // uses (`[Name(x, y)]` destructure, `[Name(field:val)]` constraint) can
+    // resolve field names without re-stating their types. Slice-5 restriction:
+    // the struct must be declared before any use that omits field types.
+
+    // --- Trait impl blocks ---
+    // Form: `assign trait TypeName:TraitName { method-decls... }`
+    //
+    // Each method inside the braces has the compact form
+    // `name(params):returnSort -> body` (no `method` keyword, no `Type.`
+    // prefix — both implicit from the block header). The parser desugars
+    // to an `IrStmt.TraitImpl` whose methods are full FunctionDecls with
+    // self prepended and the type-qualified name.
+
+    /**
+     * Dispatches the two {@code assign} forms by the keyword after {@code assign}:
+     * {@code assign trait …} (trait impl) vs {@code assign proof …}
+     * (return-refinement proof).
+     */
+    /** Index-kind words for `assign <kind> index …` — contextual, not reserved. */
+    private static final Set<String> INDEX_KINDS = Set.of("unique", "ordinal", "cardinal");
+
+    private int indexSeq = 0;
+
+    private IrStmt parseAssign() throws ParseException {
+        CardinalToken next = peek(1);  // the token after "assign"
+        if (next.kind() == CardinalToken.Kind.IDENT && next.text().equals("proof")) {
+            return parseAssignProof();
+        }
+        // `assign <unique|ordinal|cardinal> index NAME:[ (n:T) -> key ]` — a standing index
+        // declaration (docs/stream-queries.md §3, docs/keyed.md). The kind word and `index`
+        // are contextual (not reserved), disambiguated by `<kind> index` appearing together.
+        if (next.kind() == CardinalToken.Kind.IDENT && INDEX_KINDS.contains(next.text())
+                && peek(2).kind() == CardinalToken.Kind.IDENT && peek(2).text().equals("index")) {
+            return parseAssignIndex();
+        }
+        return parseAssignTrait();
+    }
+
+    /**
+     * A standing index declaration (docs/stream-queries.md §3, docs/keyed.md):
+     * {@code assign <kind> index NAME:[ (n:T) -> keyExpr ]}, {@code kind ∈ unique|ordinal|cardinal}.
+     * An index is a NAMED key-mapping {@code T → K} decoupled from {@code T}'s intrinsic identity —
+     * several views over one {@code T} may key it differently (James, 2026-07-29). {@code K} is a
+     * value carrying {@code {hashCode, equals}} (a type with that trait, or a tuple of primitive
+     * value types that get it for free); a compound key is the fragment's tuple return.
+     *
+     * <p>Lowered — mirroring {@code action}/{@code conduit} — to an ordinary
+     * {@link IrStmt.FunctionDecl} under a reserved, non-lexable {@code #index#<seq>#<kind>#<name>}
+     * key, so every downstream pass handles it uniformly and the key-transform's body is
+     * <b>type-checked for free</b> (its projection validated against {@code T}). This slice (B1)
+     * only parses + type-checks; registration (B2) and structure/pushdown (Slice C) follow. It
+     * drives no structure and enforces no uniqueness constraint — the kind is a hint only.
+     */
+    private IrStmt parseAssignIndex() throws ParseException {
+        CardinalToken start = expectKeyword("assign");
+        String kind = expect(CardinalToken.Kind.IDENT).text();   // unique | ordinal | cardinal
+        expect(CardinalToken.Kind.IDENT);                         // "index" (guaranteed by dispatch)
+        String name = parseDeclarationName();
+        expect(CardinalToken.Kind.COLON);
+        if (!looksLikeClause()) {
+            throw new ParseException(
+                    "an index declaration expects a key-transform fragment `[ (n:T) -> keyExpr ]` "
+                            + "after `:` (docs/stream-queries.md §3)", peek().origin());
+        }
+        IrExpr.Lambda frag = parseClause();
+        if (frag.params().size() != 1) {
+            throw new ParseException(
+                    "an index key-transform takes exactly one parameter (the element `n:T`); got "
+                            + frag.params().size(), start.origin());
+        }
+        String key = "#index#" + (indexSeq++) + "#" + kind + "#" + name;
+        return new IrStmt.FunctionDecl(key, frag.params(), IrSort.named("_"), frag.body(), start.origin());
+    }
+
+    /**
+     * Parses {@code assign proof NAME(params):PIN}. The PIN is either a
+     * case-function proof {@code [ (match s …) -> [Sort] ]} — whose ordered
+     * {@code [guard] -> expr} arms cut the domain into regions the engine can
+     * discharge (the arm bodies are inert; only the guards matter) — or a bare
+     * sort {@code [Sort]} for a bodyless proof asking for native discharge. The
+     * granted sort is the return refinement the proof proves; the target
+     * function declares only a base return.
+     */
+    private IrStmt parseAssignProof() throws ParseException {
+        CardinalToken start = expectKeyword("assign");
+        expectKeyword("proof");
+        String functionName = parseDottedName();
+        // `assign proof f:Property` — a whole-function property CLAIM (no `=`, no
+        // param list). The property head after `:` is a bare IDENT, optionally with
+        // an empty `()`. It emits the same IrStmt.Proof node the `proof f = X()` form
+        // produces, so the head-name picks the gate downstream (`Algebraic` → the
+        // algebraic gate; `Reversible`/`DataConservative`/… → the conservation gate).
+        // Discriminates against the `(params):PIN` return-proof form by the `:` that
+        // follows the name directly (that form always has `(` there instead).
+        if (peek().kind() == CardinalToken.Kind.COLON) {
+            consume();  // ':'
+            CardinalToken head = expect(CardinalToken.Kind.IDENT);
+            Origin origin = start.spanTo(head);
+            if (peek().kind() == CardinalToken.Kind.LPAREN) {
+                expect(CardinalToken.Kind.LPAREN);
+                CardinalToken close = expect(CardinalToken.Kind.RPAREN);  // v1: no-argument properties
+                origin = start.spanTo(close);
+            }
+            IrExpr tree = new IrExpr.Call(head.text(), java.util.List.of(), origin);
+            return new IrStmt.Proof(functionName, tree, origin);
+        }
+        expect(CardinalToken.Kind.LPAREN);
+        List<IrParam> params = parseParamList(CardinalToken.Kind.RPAREN);
+        expect(CardinalToken.Kind.RPAREN);
+        drainParamDestructures();  // proof params don't use `.{}`; keep the buffer clean
+        if (!drainParamConversions().isEmpty()) {
+            throw new ParseException("a conversion-clause param `[A -> B]` is not supported on a "
+                    + "proof — proof params are inert", start.origin());
+        }
+        expect(CardinalToken.Kind.COLON);
+
+        // Push proof params into scope so the case-function's `[@…]` arms infer
+        // the subject's base sort, exactly as a function body's match arms do.
+        Map<String, IrSort> savedScope = new LinkedHashMap<>(currentScope);
+        currentScope.clear();
+        for (IrParam p : params) currentScope.put(p.name(), p.sort());
+        try {
+            // Case-function pin `[ (match s …) -> [Sort] ]`: the `[` is followed by
+            // `(`. A bare sort (any other token after `[`, or no `[`) is a bodyless
+            // proof.
+            if (peek().kind() == CardinalToken.Kind.LBRACKET && peek(1).kind() == CardinalToken.Kind.LPAREN) {
+                consume();  // the pin's opening '['
+                expect(CardinalToken.Kind.LPAREN);
+                IrExpr body = parseMatch();
+                expect(CardinalToken.Kind.RPAREN);
+                expect(CardinalToken.Kind.ARROW);
+                IrSort grantedReturn = parseSort();
+                CardinalToken close = expect(CardinalToken.Kind.RBRACKET);
+                return new IrStmt.ReturnProof(
+                        functionName, params, grantedReturn, body, start.spanTo(close));
+            }
+            IrSort grantedReturn = parseSort();
+            return new IrStmt.ReturnProof(functionName, params, grantedReturn, null, start.origin());
+        } finally {
+            currentScope.clear();
+            currentScope.putAll(savedScope);
+        }
+    }
+
+    private IrStmt parseAssignTrait() throws ParseException {
+        CardinalToken start = expectKeyword("assign");
+        expectKeyword("trait");
+        CardinalToken typeNameTok = expect(CardinalToken.Kind.IDENT);
+        // The impl's own `[type T]` binder (`assign trait Element[type T]:…`,
+        // docs/type-parameters.md §2.1): it INTRODUCES T as a variable into the
+        // impl's scope — the toggle that tells `Stream[T]` apart from a concrete
+        // `Stream[SomeType]`. Reuses the decl-site slot parser.
+        Map<String, IrSort> implTypeParams = peek().kind() == CardinalToken.Kind.LBRACKET
+                ? parseTypeParamSlot()
+                : new LinkedHashMap<>();
+        expect(CardinalToken.Kind.COLON);
+        CardinalToken traitNameTok = expect(CardinalToken.Kind.IDENT);
+        // Type arguments applied to the trait (`…:Stream[T]` / `…:Stream[Int]`):
+        // a plain sort list, not a binder — the `[T]` here is a USE of the
+        // variable bound by the slot above (or a concrete type).
+        List<IrSort> traitTypeArgs = new ArrayList<>();
+        if (peek().kind() == CardinalToken.Kind.LBRACKET) {
+            expect(CardinalToken.Kind.LBRACKET);
+            boolean firstArg = true;
+            while (peek().kind() != CardinalToken.Kind.RBRACKET) {
+                if (!firstArg) expect(CardinalToken.Kind.COMMA);
+                traitTypeArgs.add(parseSort());
+                firstArg = false;
+            }
+            expect(CardinalToken.Kind.RBRACKET);
+        }
+        expect(CardinalToken.Kind.LBRACE);
+
+        String typeName = typeNameTok.text();
+        // `this` is the (possibly parametric) subject — `Element[T]` when the
+        // impl binds `[type T]`, so the self-type carries its variables.
+        List<IrSort> selfArgs = new ArrayList<>(implTypeParams.size());
+        for (String tp : implTypeParams.keySet()) {
+            selfArgs.add(new IrSort.Named(tp, typeNameTok.origin()));
+        }
+        IrSort selfSort = new IrSort.Named(typeName, selfArgs, typeNameTok.origin());
+
+        List<IrStmt.FunctionDecl> methods = new ArrayList<>();
+        List<IrStmt.FunctionDecl> attributeProducers = new ArrayList<>();
+        // Associated-type bindings: `type X = [Sort]` — supplies the concrete
+        // type for the trait's `type X` member. Bound with `=` (a type, not a
+        // `->` producer value).
+        Map<String, IrSort> typeBindings = new LinkedHashMap<>();
+        while (peek().kind() != CardinalToken.Kind.RBRACE) {
+            if (peek().kind() == CardinalToken.Kind.IDENT && peek().text().equals("type")) {
+                consume();  // `type`
+                CardinalToken varName = expect(CardinalToken.Kind.IDENT);
+                expect(CardinalToken.Kind.EQUALS);   // `=`
+                IrSort boundType = parseSort();  // the supplied type (`[Int]`)
+                if (typeBindings.containsKey(varName.text())) {
+                    throw new ParseException(
+                            "Duplicate associated-type binding '" + varName.text()
+                                    + "' in trait impl",
+                            varName.origin());
+                }
+                typeBindings.put(varName.text(), boundType);
+                continue;
+            }
+            // A member is a METHOD if `(` follows its name (`ping():Int -> …`)
+            // and an ATTRIBUTE producer if `:` does (`weight:Int -> …`). Both
+            // are `member <- producer` arrows; only the `()` differs.
+            if (peek(1).kind() == CardinalToken.Kind.COLON) {
+                attributeProducers.add(
+                        parseTraitImplAttribute(typeName, traitNameTok.text(), selfSort));
+            } else {
+                methods.add(parseTraitImplMethod(typeName, selfSort));
+            }
+        }
+        CardinalToken close = expect(CardinalToken.Kind.RBRACE);
+        return new IrStmt.TraitImpl(
+                typeName, traitNameTok.text(), methods, attributeProducers,
+                typeBindings, implTypeParams, traitTypeArgs, start.spanTo(close));
+    }
+
+    /**
+     * Parses one attribute producer inside an {@code assign trait} block.
+     * Surface form: {@code name:Sort -> producer}. The producer is an
+     * expression over {@code this} (the instance); a trait attribute is a
+     * computed projection. Lowered to a 0-user-arg {@link IrStmt.FunctionDecl}
+     * {@code Type.name(this):Sort -> producer} so it registers in dispatch like
+     * a 0-arg method and rides the return-refinement gate (the {@code Sort}
+     * refinement, e.g. {@code [Int:@>0]}, is verified against the producer).
+     */
+    private IrStmt.FunctionDecl parseTraitImplAttribute(
+            String typeName, String traitName, IrSort selfSort) throws ParseException {
+        CardinalToken nameTok = expect(CardinalToken.Kind.IDENT);
+        if (KEYWORDS.contains(nameTok.text())) {
+            throw new ParseException(
+                    "Cannot use keyword '" + nameTok.text() + "' as an attribute name",
+                    nameTok.origin());
+        }
+        expect(CardinalToken.Kind.COLON);
+        IrSort declaredSort = parseSort();
+        expect(CardinalToken.Kind.ARROW);
+
+        // The impl states the base type; the trait CONTRACT supplies the
+        // refinement (`weight:Int -> 1` is checked against the contract's
+        // `[Int:@>0]`, not bare `Int`). Adopt the contract attribute sort as the
+        // producer's return obligation when the trait was declared earlier in
+        // this file (the common case); otherwise fall back to the impl-declared
+        // sort. `declaredFunctionReturns` holds `Trait.attr -> contractSort`
+        // from the trait's `Type{…}` declaration.
+        IrSort contractSort = declaredFunctionReturns.get(traitName + "." + nameTok.text());
+        IrSort obligation = contractSort != null ? contractSort : declaredSort;
+
+        List<IrParam> params = List.of(new IrParam("this", selfSort));
+        Map<String, IrSort> savedScope = new LinkedHashMap<>(currentScope);
+        currentScope.clear();
+        currentScope.put("this", selfSort);
+        try {
+            IrExpr producer = parseExpr();
+            String qualified = typeName + "." + nameTok.text();
+            declaredFunctionReturns.put(qualified, obligation);
+            return new IrStmt.FunctionDecl(
+                    qualified, params, obligation, producer, nameTok.origin());
+        } finally {
+            currentScope.clear();
+            currentScope.putAll(savedScope);
+        }
+    }
+
+    /**
+     * Parses one method inside an {@code assign trait} block.
+     * Surface form: {@code methodName(params):returnSort -> body}.
+     * The parser prepends a {@code self:TypeName} param and qualifies the
+     * method's name to {@code TypeName.methodName}. Body parses with self
+     * + user params in {@link #currentScope}.
+     */
+    private IrStmt.FunctionDecl parseTraitImplMethod(String typeName, IrSort selfSort)
+            throws ParseException {
+        CardinalToken nameTok = expect(CardinalToken.Kind.IDENT);
+        if (KEYWORDS.contains(nameTok.text())) {
+            throw new ParseException(
+                    "Cannot use keyword '" + nameTok.text() + "' as a method name",
+                    nameTok.origin());
+        }
+        expect(CardinalToken.Kind.LPAREN);
+        List<IrParam> userParams = parseParamList(CardinalToken.Kind.RPAREN);
+        expect(CardinalToken.Kind.RPAREN);
+        List<ParamDestructure> destrs = drainParamDestructures();
+        if (!drainParamConversions().isEmpty()) {
+            throw new ParseException("an argument shell `[A -> B]` belongs on the TRAIT method, "
+                    + "not the impl — the impl writes only the kernel parameter (its codomain "
+                    + "type); the trait owns the shell", nameTok.origin());
+        }
+        expect(CardinalToken.Kind.COLON);
+        IrSort returnSort = parseSort();
+        // The impl method's return is a plain VALUE sort — never a `[Method(...)]` /
+        // `[Action(...)]` / `[Conduit(...)]` call-signature. `name():[Method():Ret]`
+        // is the doubled form (the `()` already says it's a method); write `name():Ret`.
+        if (returnSort instanceof IrSort.CallSig csRet
+                && isCallableMemberKind(CallKinds.builtin(csRet.typeName()))) {
+            throw new ParseException(
+                    "Method '" + nameTok.text() + "' returns a `[" + csRet.typeName()
+                            + "(...)]` sort — the `()` already declares a method, so its return "
+                            + "must be a plain value sort. Drop the `[" + csRet.typeName()
+                            + "(...)]` wrapper: write `" + nameTok.text() + "(...):Ret`.",
+                    nameTok.origin());
+        }
+        expect(CardinalToken.Kind.ARROW);
+
+        List<IrParam> allParams = new ArrayList<>(userParams.size() + 1);
+        allParams.add(new IrParam("this", selfSort));
+        allParams.addAll(userParams);
+
+        Map<String, IrSort> savedScope = new LinkedHashMap<>(currentScope);
+        currentScope.clear();
+        for (IrParam p : allParams) currentScope.put(p.name(), p.sort());
+        bindParamDestructures(destrs);
+        try {
+            IrExpr body = wrapParamDestructures(parseExpr(), destrs);
+            String qualified = typeName + "." + nameTok.text();
+            declaredFunctionReturns.put(qualified, returnSort);
+            return new IrStmt.FunctionDecl(
+                    qualified, allParams, returnSort, body, nameTok.origin());
+        } finally {
+            currentScope.clear();
+            currentScope.putAll(savedScope);
+        }
+    }
+
+    /**
+     * Proof declaration: {@code proof <functionName> = <structTree>}. The RHS
+     * is an ordinary expression — a {@code Leaf}/{@code Split} struct-literal
+     * tree — captured <b>unevaluated</b> as {@link IrStmt.Proof}'s tree. The
+     * return-refinement gate translates and validates it; nothing here checks
+     * its shape (so {@code Split}'s predicate stays a symbolic comparison). The
+     * {@code Leaf}/{@code Split} structs must be declared earlier so the RHS
+     * parses through the struct-literal path into an {@link IrExpr.Record}.
+     */
+    private IrStmt parseProof() throws ParseException {
+        CardinalToken start = expectKeyword("proof");
+        String functionName = parseDottedName();
+        expect(CardinalToken.Kind.EQUALS);
+        IrExpr tree = parseExpr();
+        return new IrStmt.Proof(functionName, tree, start.origin());
+    }
+
+    private IrStmt parseStruct() throws ParseException {
+        CardinalToken start = expectKeyword("struct");
+        CardinalToken nameTok = expect(CardinalToken.Kind.IDENT);
+        // Optional `[type T, …]` — the type-parameter slot (docs/type-parameters.md
+        // §2.1), directly after the name and before the is-a/fields. A bare `[`
+        // here is unambiguous: the is-a uses `:[…]` (colon), fields use `(…)`.
+        Map<String, IrSort> typeParams = peek().kind() == CardinalToken.Kind.LBRACKET
+                ? parseTypeParamSlot()
+                : new LinkedHashMap<>();
+        // Optional `:[Base:rel]` — the is-a relationship (S2). The parsed sort
+        // (Named / Refined / Union) is stored whole on the Structural; its
+        // refinement predicate, if any, is the demotion morphism. SortChecker
+        // validates that the base resolves and the morphism is total.
+        IrSort baseSort = null;
+        if (peek().kind() == CardinalToken.Kind.COLON) {
+            consume();
+            baseSort = parseSort();
+        }
+        expect(CardinalToken.Kind.LPAREN);
+        Map<String, IrSort> members = new LinkedHashMap<>();
+        boolean first = true;
+        while (atMemberBoundary(first, CardinalToken.Kind.RPAREN)) {
+            CardinalToken fieldName = expect(CardinalToken.Kind.IDENT);
+            expect(CardinalToken.Kind.COLON);
+            IrSort fieldSort = parseSort();
+            members.put(fieldName.text(), fieldSort);
+            first = false;
+        }
+        CardinalToken end = expect(CardinalToken.Kind.RPAREN);
+        // Optional member block `{ name(params):Ret -> body … }` — the struct
+        // member block (docs/struct-methods.md). It holds compact-form method
+        // decls only (no `method` keyword — that stays valid only for standalone
+        // `method Type.m` decls outside any block). Each method lowers to a
+        // standalone `Struct.m(this:Struct, …)` FunctionDecl on the pending
+        // channel — reusing the exact `assign trait` method desugar. The trait
+        // obligations named in the is-a base (`:[Super & T1 & T2]`) are split out
+        // of the intersection and verified against these methods downstream
+        // (StructTraitLowering + SortChecker), so a struct declares its methods
+        // once here and each declared trait is checked against that one set.
+        List<IrStmt.FunctionDecl> blockMethods = new ArrayList<>();
+        Map<String, IrExpr> extensions = new LinkedHashMap<>();
+        List<IrSort> selfArgs = new ArrayList<>(typeParams.size());
+        for (String tp : typeParams.keySet()) {
+            selfArgs.add(new IrSort.Named(tp, nameTok.origin()));
+        }
+        IrSort selfSort = new IrSort.Named(nameTok.text(), selfArgs, nameTok.origin());
+        // Optional constructor-extension BODY: `struct Name(fields) -> <preamble>`.
+        // A function body in the ruled let-led member model — all-preamble, unit
+        // (no terminal expression), each line `let this.name(:Sort)? = expr`
+        // binding a NEW field. The default constructor always runs first; the
+        // body may only ADD fields (a `let this.<ctor-field>` reassignment is
+        // rejected), and each added field is materialized on every value at
+        // construction, so it can never be undefined. The `this.` target is the
+        // body's terminator: a following top-level `let x = …` doesn't continue it.
+        if (peek().kind() == CardinalToken.Kind.ARROW) {
+            CardinalToken arrow = consume();
+            boolean any = false;
+            while (peek().kind() == CardinalToken.Kind.IDENT && peek().text().equals("let")
+                    && peek(1).kind() == CardinalToken.Kind.IDENT && peek(1).text().equals("this")
+                    && peek(2).kind() == CardinalToken.Kind.DOT) {
+                end = parseStructExtensionField(nameTok.text(), selfSort, members, extensions);
+                any = true;
+            }
+            if (!any) {
+                throw new ParseException(
+                        "A struct constructor body (`-> …`) must contain at least one "
+                                + "`let this.<name> = <expr>` extension line",
+                        arrow.origin());
+            }
+        }
+        // Optional member block `{ methods… }` (docs/struct-methods.md).
+        if (peek().kind() == CardinalToken.Kind.LBRACE) {
+            consume();  // {
+            while (peek().kind() != CardinalToken.Kind.RBRACE) {
+                blockMethods.add(parseTraitImplMethod(nameTok.text(), selfSort));
+            }
+            end = expect(CardinalToken.Kind.RBRACE);
+        }
+        Origin origin = start.spanTo(end);
+        if (sibarum.cardinal.ir.NativeConstructors.has(nameTok.text())) {
+            throw new ParseException(
+                    "'" + nameTok.text() + "' is a native type — its constructor "
+                            + "is built in and cannot be redeclared",
+                    nameTok.origin());
+        }
+        IrSort.Structural structSort = new IrSort.Structural(
+                nameTok.text(), members, baseSort, typeParams, extensions, origin);
+        types.register(nameTok.text(), new TypeInfo.Struct(structSort));
+        // The struct decl is returned as the statement; its block methods ride
+        // the pending-decl channel so they land right after it (drained by the
+        // top-level loop in declaration order).
+        pendingTopLevelDecls.addAll(blockMethods);
+        return new IrStmt.TypeAlias(nameTok.text(), structSort, origin);
+    }
+
+    /**
+     * Parses one line of a struct constructor body:
+     * {@code let this.name(:Sort)? = expr}. The default constructor is always
+     * executed first; the body runs after it and may only ADD fields — a name
+     * that collides with a constructor field (a reassignment) is rejected here,
+     * and a collision with an inherited base field is rejected by SortChecker.
+     * The initializer is an expression over {@code this.<field>} (constructor
+     * fields and earlier extension fields), literals, and operators — a total
+     * expression over already-bound fields, which is what makes the added
+     * field guaranteed never-undefined. ConstructionGate materializes it into
+     * every constructed value and judges it against the declared sort exactly
+     * like a constructor argument. Returns the line's last token (for the
+     * decl's origin span).
+     */
+    private CardinalToken parseStructExtensionField(
+            String typeName, IrSort selfSort,
+            Map<String, IrSort> members, Map<String, IrExpr> extensions) throws ParseException {
+        expectKeyword("let");
+        expectKeyword("this");
+        expect(CardinalToken.Kind.DOT);
+        CardinalToken nameTok = expect(CardinalToken.Kind.IDENT);
+        if (members.containsKey(nameTok.text())) {
+            throw new ParseException(
+                    "Extension field '" + nameTok.text() + "' reassigns a field the default "
+                            + "constructor of '" + typeName + "' already binds — a constructor "
+                            + "body may only ADD fields, never reassign constructor fields",
+                    nameTok.origin());
+        }
+        IrSort declaredSort = null;
+        if (peek().kind() == CardinalToken.Kind.COLON) {
+            consume();
+            declaredSort = parseSort();
+        }
+        expect(CardinalToken.Kind.EQUALS);
+        Map<String, IrSort> savedScope = new LinkedHashMap<>(currentScope);
+        currentScope.clear();
+        currentScope.put("this", selfSort);
+        IrExpr init;
+        try {
+            init = parseExpr();
+        } finally {
+            currentScope.clear();
+            currentScope.putAll(savedScope);
+        }
+        validateExtensionInit(init, typeName, nameTok.text(), members);
+        if (declaredSort == null) {
+            declaredSort = inferExtensionSort(init, members);
+            if (declaredSort == null) {
+                throw new ParseException(
+                        "Cannot infer the sort of extension field '" + nameTok.text() + "' of '"
+                                + typeName + "' — annotate it: `let this." + nameTok.text()
+                                + ":<Sort> = …`",
+                        nameTok.origin());
+            }
+        }
+        members.put(nameTok.text(), declaredSort);
+        extensions.put(nameTok.text(), init);
+        return nameTok;
+    }
+
+    /**
+     * Sort inference over the extension-initializer whitelist (closed grammar:
+     * literals, {@code this.<field>} reads, operators) — a field read carries
+     * the field's declared sort; arithmetic follows the primitive tower
+     * (String concat → String, any Decimal → Decimal, Int-on-Int → Int);
+     * comparisons/logic → Bool. {@code null} (annotate explicitly) for
+     * anything else — e.g. arithmetic over user-typed operands, whose result
+     * is an operator overload's business.
+     */
+    private static IrSort inferExtensionSort(IrExpr e, Map<String, IrSort> members) {
+        return switch (e) {
+            case IrExpr.Lit l -> new IrSort.Named("Int", l.origin());
+            case IrExpr.Dec d -> new IrSort.Named("Decimal", d.origin());
+            case IrExpr.Str s -> new IrSort.Named("String", s.origin());
+            case IrExpr.Bool b -> new IrSort.Named("Bool", b.origin());
+            case IrExpr.Chr c -> new IrSort.Named("Char", c.origin());
+            case IrExpr.FieldAccess fa when fa.base() instanceof IrExpr.Var v
+                    && v.name().equals("this") -> members.get(fa.fieldName());
+            case IrExpr.BinOp op -> switch (op.op()) {
+                case LT, LE, GT, GE, EQ, NE, APPROX, AND, OR ->
+                        new IrSort.Named("Bool", op.origin());
+                default -> {
+                    IrSort ls = inferExtensionSort(op.left(), members);
+                    IrSort rs = inferExtensionSort(op.right(), members);
+                    String lb = ls == null ? null : baseSortName(ls);
+                    String rb = rs == null ? null : baseSortName(rs);
+                    if (op.op() == IrExpr.Op.ADD && ("String".equals(lb) || "String".equals(rb))) {
+                        yield new IrSort.Named("String", op.origin());
+                    }
+                    if ("Decimal".equals(lb) || "Decimal".equals(rb)) {
+                        yield new IrSort.Named("Decimal", op.origin());
+                    }
+                    if ("Int".equals(lb) && "Int".equals(rb)) {
+                        yield new IrSort.Named("Int", op.origin());
+                    }
+                    yield null;
+                }
+            };
+            default -> null;
+        };
+    }
+
+    /**
+     * The extension-initializer whitelist: literals, {@code this.<field>}
+     * references to fields already bound at that point (constructor fields and
+     * earlier extension fields — so initializers are total by construction),
+     * field-access chains rooted there, and built-in operators over those.
+     * Anything else (a call, a match, a bare name) is rejected — the
+     * initializer must be provably defined at construction time.
+     */
+    private static void validateExtensionInit(
+            IrExpr e, String typeName, String extName, Map<String, IrSort> members)
+            throws ParseException {
+        switch (e) {
+            case IrExpr.Lit l -> { }
+            case IrExpr.Dec d -> { }
+            case IrExpr.Bool b -> { }
+            case IrExpr.Chr c -> { }
+            case IrExpr.Str s -> { }
+            case IrExpr.BinOp op -> {
+                validateExtensionInit(op.left(), typeName, extName, members);
+                validateExtensionInit(op.right(), typeName, extName, members);
+            }
+            case IrExpr.FieldAccess fa -> {
+                if (fa.base() instanceof IrExpr.Var v && v.name().equals("this")) {
+                    if (!members.containsKey(fa.fieldName())) {
+                        throw new ParseException(
+                                "Extension field '" + extName + "' of '" + typeName
+                                        + "' references 'this." + fa.fieldName() + "', which is "
+                                        + "not bound yet at construction — an initializer may "
+                                        + "only read constructor fields and extension fields "
+                                        + "declared above it; available: " + members.keySet(),
+                                fa.origin());
+                    }
+                } else {
+                    validateExtensionInit(fa.base(), typeName, extName, members);
+                }
+            }
+            default -> throw new ParseException(
+                    "Extension field '" + extName + "' of '" + typeName + "' has an "
+                            + "initializer form that cannot be proved defined at construction — "
+                            + "use literals, `this.<field>` reads, and operators",
+                    e.origin());
+        }
+    }
+
+    /**
+     * Parses the {@code [type T, type R, …]} type-parameter slot that sits
+     * directly after a struct/function/trait name (docs/type-parameters.md §2.1).
+     * Returns name → bound, a {@code null} bound meaning an unbounded
+     * {@code type T}. Assumes the next token is the opening {@code [}.
+     */
+    private static final java.util.Set<String> PRIMITIVE_SORTS =
+            java.util.Set.of("Int", "Bool", "Char", "Decimal", "String");
+
+    /**
+     * Collects inline-destructured type variables (docs/type-parameters.md §2.4)
+     * from {@code sort} into {@code typeParams}: a bare name appearing as a type
+     * ARGUMENT (`Box[T]`) that names no known sort — not a primitive, declared
+     * struct, trait, or alias, and not already a type parameter — is a fresh
+     * destructured variable (bound unbounded, {@code null}). Recurses through
+     * nesting; only argument positions are collected, never a sort's own head.
+     */
+    private void collectInlineTypeVars(IrSort sort, Map<String, IrSort> typeParams) {
+        if (!(sort instanceof IrSort.Named n)) return;
+        for (IrSort arg : n.typeArgs()) {
+            if (arg instanceof IrSort.Named an && an.typeArgs().isEmpty()
+                    && !PRIMITIVE_SORTS.contains(an.name())
+                    && !types.isDeclared(an.name())
+                    && !typeParams.containsKey(an.name())) {
+                typeParams.put(an.name(), null);
+            }
+            collectInlineTypeVars(arg, typeParams);
+        }
+    }
+
+    private Map<String, IrSort> parseTypeParamSlot() throws ParseException {
+        expect(CardinalToken.Kind.LBRACKET);
+        Map<String, IrSort> params = new LinkedHashMap<>();
+        boolean first = true;
+        while (peek().kind() != CardinalToken.Kind.RBRACKET) {
+            if (!first) expect(CardinalToken.Kind.COMMA);
+            if (peek().kind() != CardinalToken.Kind.IDENT || !peek().text().equals("type")) {
+                throw new ParseException(
+                        "type-parameter slot expects `type NAME`; got '" + peek().text() + "'",
+                        peek().origin());
+            }
+            consume();  // `type`
+            CardinalToken nameTok = expect(CardinalToken.Kind.IDENT);
+            IrSort bound = null;
+            if (peek().kind() == CardinalToken.Kind.COLON) {
+                consume();  // `:`
+                bound = parseSort();   // the bound — `[type T:R]`
+            }
+            if (params.containsKey(nameTok.text())) {
+                throw new ParseException(
+                        "Duplicate type parameter '" + nameTok.text() + "'", nameTok.origin());
+            }
+            params.put(nameTok.text(), bound);
+            first = false;
+        }
+        expect(CardinalToken.Kind.RBRACKET);
+        return params;
+    }
+
+    // --- Sorts ---
+    // Slice 2 scope:
+    //   - Bare ident: `Int`        ≡  `[Int]`     → IrSort.Named
+    //   - Bracketed:  `[Int]`                      → IrSort.Named
+    //   - Refined:    `[Base:pred]`                → IrSort.Refined(Base, cookedPred)
+    //
+    // The predicate goes through `applyPredicateSugar`:
+    //   - Top-level comparison (==, !=, <, <=, >, >=) → used as-is
+    //   - Top-level `|` or `&`                        → recurse into operands
+    //   - Anything else                               → wrap as `@ == EXPR`
+    //
+    // So `[Int:0]` ≡ `[Int:@==0]`, `[Int:n*2]` ≡ `[Int:@==n*2]`,
+    // `[Int:0|1]` ≡ `[Int:@==0 | @==1]`, but `[Int:@>0]` and
+    // `[Int:@>0 & @<10]` stay untouched.
+
+    /**
+     * Speculatively reads a cast target — a sort immediately followed by `:` —
+     * from inside an opening `(` (the cursor sits just past the LPAREN). On a
+     * match it consumes the sort and the `:` and returns the sort; otherwise it
+     * restores the cursor and returns {@code null} so the caller parses the
+     * parens as an ordinary grouping/tuple. Gated by the capitalization law: a
+     * cast target is a `[…]` refinement or a Capitalized type name, never a
+     * lowercase binder name — this keeps `(x : …)` from ever reading as a cast.
+     */
+    private IrSort tryParseCastTarget() {
+        CardinalToken t = peek();
+        boolean plausible = t.kind() == CardinalToken.Kind.LBRACKET
+                || (t.kind() == CardinalToken.Kind.IDENT
+                        && !t.text().isEmpty()
+                        && Character.isUpperCase(t.text().charAt(0)));
+        if (!plausible) {
+            return null;
+        }
+        int save = pos;
+        try {
+            IrSort sort = parseSort();
+            if (peek().kind() == CardinalToken.Kind.COLON) {
+                consume();   // the cast colon
+                return sort;
+            }
+        } catch (ParseException e) {
+            // Not a sort after all — fall through to grouping.
+        }
+        pos = save;
+        return null;
+    }
+
+    public IrSort parseSort() throws ParseException {
+        CardinalToken t = peek();
+        // Bare tuple sort `{S0, S1, …}` — the bracket-free spelling of `[{…}]`.
+        // A param type `t:{Inner, Int}` (or a tuple PATTERN `{i, k}` in a
+        // braceless match arm) starts at `{`; `parseBracketSort` only reaches the
+        // tuple body after a `[`, so accept the bare form here for parity. The
+        // body grammar (type elements vs positional binders) is governed by
+        // parsingTuplePattern, exactly as in the bracketed path. (BRACE-AGGREGATES
+        // WAR: the paren form `(S0, S1)` is retired — parens are grouping/calls.)
+        if (t.kind() == CardinalToken.Kind.LBRACE) {
+            return parseTupleSortBody(t);
+        }
+        if (t.kind() == CardinalToken.Kind.LBRACKET) {
+            // Unified clause-chain (docs/arrows.md): a bracketed `[ stage -> … ]`
+            // threads `@`. Output kind is read from the FIRST stage, and the split
+            // is by POSITION (a sort method can only return a sort, never a value):
+            //   • SORT-producing faces are dispatched HERE — the in-type pipeline
+            //     `[let x:S = E -> … -> Base:@==witness]`, via the unified
+            //     parseClauseStages projected to a sort (asRefinedSort).
+            //   • VALUE-producing faces (the named-binder fragment and the
+            //     anonymous-`@` conversion chain, both → an IrExpr.Lambda) are
+            //     dispatched from VALUE positions via parseClause — they are not
+            //     sorts, so they cannot be hosted by parseSort.
+            // The leading `let` is unambiguous (no sort starts with that keyword).
+            if (peek(1).kind() == CardinalToken.Kind.IDENT && peek(1).text().equals("let")) {
+                return asRefinedSort(parseClauseStages());
+            }
+            return parseBracketSort();
+        }
+        if (t.kind() == CardinalToken.Kind.IDENT) {
+            // `this.type` — the self-type (the receiver's runtime-actual concrete
+            // type; docs/associated-types.md §7.3). A reserved sentinel sort:
+            // `this` is the instance, `.type` projects its type. Meaningful only
+            // in a trait contract's member sorts (scoped there by SortChecker);
+            // elsewhere it validates as an unknown sort.
+            if (t.text().equals("this")
+                    && peek(1).kind() == CardinalToken.Kind.DOT
+                    && peek(2).kind() == CardinalToken.Kind.IDENT
+                    && peek(2).text().equals("type")) {
+                consume();              // this
+                consume();              // .
+                CardinalToken typeTok = consume();   // type
+                return new IrSort.Named(IrSort.SELF_TYPE, t.spanTo(typeTok));
+            }
+            // `Type{...}` — an anonymous trait sort literal, usable in ANY sort
+            // position (param/return/nested in unions/refinements), part of the
+            // unified type-spec system (parallel to `[Int:@>0]`). The
+            // `trait NAME{…}` declarator (parseTrait) names one; this is the
+            // anonymous form. (Naming a trait via `let NAME:Type{…}` is redirected
+            // to `trait` in parseLet, but the anonymous sort stays first-class.)
+            if (t.text().equals("Type") && peek(1).kind() == CardinalToken.Kind.LBRACE) {
+                consume();  // "Type"
+                return parseTraitMembers(t);
+            }
+            // `Name{e1, e2, …}` — a construction-pin return sort over a declared
+            // struct (S5): desugars to `[Name:@ == Name(e1, …)]`, so spec-only
+            // synthesis derives the body `Name(e1, …)` via the @==EXPR path.
+            if (peek(1).kind() == CardinalToken.Kind.LBRACE && types.isStruct(t.text())) {
+                return parseConstructionPinSort();
+            }
+            // `Name[arg, …]` — a parametric type application
+            // (docs/type-parameters.md §2.3): `Element[Int]`, `Element[T]`. The
+            // args are sorts. A bare `name[…]` (no `$`) is free here —
+            // metareferences are `$`-prefixed. Distinct from the `[type T]`
+            // declaration slot, which is parsed by parseTypeParamSlot at decl
+            // sites, never inside a sort.
+            if (peek(1).kind() == CardinalToken.Kind.LBRACKET) {
+                CardinalToken nameTok = consume();      // the head name
+                expect(CardinalToken.Kind.LBRACKET);
+                List<IrSort> typeArgs = new ArrayList<>();
+                boolean first = true;
+                while (peek().kind() != CardinalToken.Kind.RBRACKET) {
+                    if (!first) expect(CardinalToken.Kind.COMMA);
+                    typeArgs.add(parseTypeArg());
+                    first = false;
+                }
+                CardinalToken close = expect(CardinalToken.Kind.RBRACKET);
+                return new IrSort.Named(nameTok.text(), typeArgs, nameTok.spanTo(close));
+            }
+            // Bare-ident sugar: `Int` ≡ `[Int]`.
+            CardinalToken nameTok = consume();
+            return new IrSort.Named(nameTok.text(), nameTok.origin());
+        }
+        throw new ParseException(
+                "Expected a sort (bare ident or '[...]'); got " + t.kind() + " '" + t.text() + "'",
+                t.origin());
+    }
+
+    /**
+     * One type argument inside a parametric application {@code Name[arg, …]},
+     * accepting the <b>bare-refined shorthand</b>: {@code Stream[Int:0 <= @ < 10]}
+     * is sugar for {@code Stream[[Int:0 <= @ < 10]]}. The brackets that the
+     * bracket/paren law puts around a refinement {@code [Base:pred]} are implied
+     * by the surrounding type-arg brackets, so a trailing {@code :pred} on the arg
+     * is read as a refinement of the base just parsed — exactly as
+     * {@code parseBracketBranch} does inside {@code [ … ]}.
+     */
+    private IrSort parseTypeArg() throws ParseException {
+        IrSort base = parseSort();
+        if (peek().kind() == CardinalToken.Kind.COLON) {
+            consume();
+            IrExpr pred = parseExpr();
+            IrExpr cooked = applyPredicateSugar(pred);
+            List<IrSort> baseArgs = base instanceof IrSort.Named n ? n.typeArgs() : List.of();
+            return new IrSort.Refined(baseSortName(base), baseArgs, cooked, base.origin());
+        }
+        return base;
+    }
+
+    /**
+     * Construction-pin return sort: {@code Name{e1, e2, …}} over a declared
+     * struct desugars to {@code [Name:@ == Name(e1, …)]}, the values mapped
+     * POSITIONALLY onto the struct's declared fields. Spec-only synthesis then
+     * derives the body {@code Name(e1, …)} through the existing {@code @==EXPR}
+     * path — how {@code function promote(…):Point3D{x,y,z};} gets its body.
+     */
+    private IrSort parseConstructionPinSort() throws ParseException {
+        CardinalToken nameTok = expect(CardinalToken.Kind.IDENT);
+        IrSort.Structural struct = declaredStructShape(nameTok.text());
+        List<String> fields = new ArrayList<>(struct.constructorMembers().keySet());
+        expect(CardinalToken.Kind.LBRACE);
+        List<IrExpr> values = new ArrayList<>();
+        boolean first = true;
+        while (peek().kind() != CardinalToken.Kind.RBRACE) {
+            if (!first) expect(CardinalToken.Kind.COMMA);
+            values.add(parseExpr());
+            first = false;
+        }
+        expect(CardinalToken.Kind.RBRACE);
+        if (values.size() != fields.size()) {
+            throw new ParseException(
+                    "construction pin '" + nameTok.text() + "{…}' has " + values.size()
+                            + " value(s) but '" + nameTok.text() + "' has " + fields.size()
+                            + " field(s) " + fields,
+                    nameTok.origin());
+        }
+        Map<String, IrExpr> members = new LinkedHashMap<>();
+        for (int i = 0; i < fields.size(); i++) members.put(fields.get(i), values.get(i));
+        IrExpr construction = new IrExpr.Record(nameTok.text(), members, nameTok.origin());
+        IrExpr pin = new IrExpr.BinOp(IrExpr.Op.EQ,
+                new IrExpr.SelfRef(nameTok.origin()), construction, nameTok.origin());
+        return new IrSort.Refined(nameTok.text(), pin, nameTok.origin());
+    }
+
+    /**
+     * Parses a trait declaration: {@code trait NAME[type T, …]{ members }}.
+     * Lowers to a {@link IrStmt.TypeAlias} binding NAME to an {@link IrSort.Trait}
+     * — the dedicated declarator that replaced the retired {@code let NAME:Type{…}}
+     * form. The optional {@code [type T, …]} slot makes the trait parametric
+     * (docs/type-parameters.md §2.1). Each contract method/attribute is also
+     * registered in {@code declaredFunctionReturns} under {@code NAME.member} so
+     * method-call routing on trait-typed receivers (e.g. {@code d.quack()} where
+     * {@code d:Duck}) finds them.
+     */
+    private IrStmt parseTrait() throws ParseException {
+        CardinalToken start = expectKeyword("trait");
+        CardinalToken nameTok = expect(CardinalToken.Kind.IDENT);
+        String name = nameTok.text();
+        // Optional `[type T, …]` parametric slot — directly after the name, before
+        // the `{` body. Unambiguous: a trait body is `{…}`, the slot is `[…]`.
+        Map<String, IrSort> typeParams = peek().kind() == CardinalToken.Kind.LBRACKET
+                ? parseTypeParamSlot()
+                : new LinkedHashMap<>();
+        // Optional `: BaseTrait` — trait extension (WAR(stream)). `trait B : A {…}`
+        // makes B extend A: an impl of B must satisfy A's contract too, and a B is-a A
+        // (validated/registered by SortChecker + the trait registry, where every trait
+        // is visible — the base may be forward-declared or imported, so not checked here).
+        String baseTrait = null;
+        if (peek().kind() == CardinalToken.Kind.COLON) {
+            expect(CardinalToken.Kind.COLON);
+            baseTrait = expect(CardinalToken.Kind.IDENT).text();
+        }
+        IrSort.Trait body = parseTraitMembers(start);
+        if (peek().kind() == CardinalToken.Kind.EQUALS) {
+            throw new ParseException(
+                    "A `trait` declaration is type-level only and cannot have a value "
+                            + "(`= …`).", peek().origin());
+        }
+        IrSort.Trait named = new IrSort.Trait(
+                name, body.methods(), body.attributes(), body.associatedTypes(),
+                typeParams, body.operators(), baseTrait, List.of(),
+                body.methodDefaults(), body.returnShells(), body.argShells(), body.origin());
+        types.register(name, new TypeInfo.Trait(named));
+        for (Map.Entry<String, IrSort.CallSig> e : named.methods().entrySet()) {
+            declaredFunctionReturns.put(name + "." + e.getKey(), e.getValue().returnSort());
+        }
+        // A data attribute is a computed projection — accessing it through the
+        // trait view (`d.weight`, d:Duck) routes to the satisfier's
+        // `Type.weight(this)` producer, so register `TraitName.attr` as a 0-arg
+        // accessor return (mirrors the method registration above).
+        for (Map.Entry<String, IrSort> e : named.attributes().entrySet()) {
+            declaredFunctionReturns.put(name + "." + e.getKey(), e.getValue());
+        }
+        return new IrStmt.TypeAlias(name, named, named.origin());
+    }
+
+    /**
+     * Parses a conductor declaration (docs/orchestration.md, §Authoring) — the third authorable
+     * type: {@code conductor Name { field:Sort = init, handler:[Action(e:E):_], … }}. Two member
+     * kinds, comma-separated like every other member block:
+     * <ul>
+     *   <li><b>state field</b> — {@code name:Sort = initExpr}: the conductor's mutable, single-owner
+     *       state (the one place mutation is safe — one thread drains it). The trailing {@code = init}
+     *       is what distinguishes it from a handler.</li>
+     *   <li><b>handler</b> — {@code name:[Action(e:E):_]} / {@code name:[Conduit(e:E,s:S):S]}: an
+     *       effectful member, recognized by call-kind exactly as in a trait's member block
+     *       ({@link #isCallableMemberKind}).</li>
+     * </ul>
+     * Cut 1 is parse + represent: it lowers to an inert {@link IrStmt.ConductorDecl}; seating and
+     * runtime wiring come later. Methods and the transform-chain handler surface are not yet parsed
+     * here.
+     */
+    private IrStmt parseConductor() throws ParseException {
+        CardinalToken start = expectKeyword("conductor");
+        CardinalToken nameTok = expect(CardinalToken.Kind.IDENT);
+        String name = nameTok.text();
+        expect(CardinalToken.Kind.LBRACE);
+        List<IrStmt.ConductorDecl.StateField> state = new ArrayList<>();
+        Map<String, IrSort.CallSig> handlers = new LinkedHashMap<>();
+        List<IrStmt.FunctionDecl> reactions = new ArrayList<>();
+        java.util.Set<String> seen = new java.util.HashSet<>();
+        boolean first = true;
+        while (atMemberBoundary(first, CardinalToken.Kind.RBRACE)) {
+            CardinalToken memberName = expect(CardinalToken.Kind.IDENT);
+            if (!seen.add(memberName.text())) {
+                throw new ParseException(
+                        "Duplicate member '" + memberName.text() + "' in conductor body",
+                        memberName.origin());
+            }
+            if (peek().kind() == CardinalToken.Kind.LPAREN) {
+                // CONCRETE handler in method-body form: `onTick(e:E) -> body` — a body-bearing event
+                // reaction. Lowered exactly like the top-level `action` keyword to a #action#-keyed
+                // FunctionDecl (event param, return `_`, body), but held on the conductor: inert
+                // until the conductor is seated (`spawn`), when the linker injects it into routing.
+                reactions.add(parseConductorReaction(name, memberName));
+                first = false;
+                continue;
+            }
+            expect(CardinalToken.Kind.COLON);
+            IrSort memberSort = parseSort();
+            if (isCellSort(memberSort) && peek().kind() == CardinalToken.Kind.LPAREN) {
+                // Explicit clocked state: `name: Cell[T](init)` (docs/orchestration.md, §"State is a
+                // clocked cell"). The one field kind that can change; the `(init)` seeds it. Stored as a
+                // StateField whose sort is `Cell[T]` — state is named in the type, not a body-position
+                // rule. (Runtime `apply`/`current`/`next` + latch-at-clock-edge are a later cut; here it
+                // is parse + represent.)
+                consume();  // `(`
+                IrExpr init = parseExpr();
+                expect(CardinalToken.Kind.RPAREN);
+                state.add(new IrStmt.ConductorDecl.StateField(memberName.text(), memberSort, init));
+            } else if (peek().kind() == CardinalToken.Kind.EQUALS) {
+                // A field with an initializer: `name:Sort = init`. Under the Mutable model a plain field
+                // is immutable (final); only a `Mutable[T]` field changes.
+                consume();
+                IrExpr init = parseExpr();
+                state.add(new IrStmt.ConductorDecl.StateField(memberName.text(), memberSort, init));
+            } else if (memberSort instanceof IrSort.CallSig cs
+                    && isCallableMemberKind(CallKinds.builtin(cs.typeName()))) {
+                // ABSTRACT handler: an Action/Conduit (or Method) call-signature contract, no body.
+                handlers.put(memberName.text(), cs);
+            } else {
+                throw new ParseException(
+                        "a conductor member is a state field (`" + memberName.text()
+                                + ":Sort = init`), a handler contract (`" + memberName.text()
+                                + ":[Action(...)]` / `[Conduit(...)]`), or a handler body (`"
+                                + memberName.text() + "(e:E) -> …`)", memberName.origin());
+            }
+            first = false;
+        }
+        CardinalToken close = expect(CardinalToken.Kind.RBRACE);
+        // Inject `this` — the conductor's state as a record sort — as a second parameter of every
+        // handler reaction, so `this` and `this.field` are in scope for the static checker (bound
+        // param) and field access type-checks against the real state fields. The event stays the
+        // FIRST param (routing keys on it); `this` is bound to the live state cell at fire time.
+        Map<String, IrSort> stateMembers = new LinkedHashMap<>();
+        for (IrStmt.ConductorDecl.StateField f : state) stateMembers.put(f.name(), f.sort());
+        IrSort stateSort = IrSort.structural(name + "$state", stateMembers);
+        List<IrStmt.FunctionDecl> typedReactions = new ArrayList<>(reactions.size());
+        for (IrStmt.FunctionDecl r : reactions) {
+            List<IrParam> params = List.of(r.params().get(0), new IrParam("this", stateSort));
+            typedReactions.add(new IrStmt.FunctionDecl(r.name(), params, r.returnSort(), r.body(), r.origin()));
+        }
+        return new IrStmt.ConductorDecl(name, state, handlers, typedReactions, start.spanTo(close));
+    }
+
+    /** True iff {@code sort} is a {@code Cell[T]} — the explicit single-owner clocked-cell type. */
+    private static boolean isCellSort(IrSort sort) {
+        return sort instanceof IrSort.Named n && "Cell".equals(n.name()) && n.typeArgs().size() == 1;
+    }
+
+    /**
+     * Parses a conductor's concrete handler in method-body form {@code name(e:E) -> body} and
+     * lowers it to a {@code #action#}-keyed reaction {@link IrStmt.FunctionDecl}, mirroring
+     * {@link #parseAction}. Exactly one event parameter; the body is scoped with it.
+     */
+    private IrStmt.FunctionDecl parseConductorReaction(String conductorName, CardinalToken nameTok)
+            throws ParseException {
+        expect(CardinalToken.Kind.LPAREN);
+        List<IrParam> params = parseParamList(CardinalToken.Kind.RPAREN);
+        expect(CardinalToken.Kind.RPAREN);
+        List<ParamDestructure> destrs = drainParamDestructures();
+        if (!drainParamConversions().isEmpty()) {
+            throw new ParseException("a conductor handler's event parameter cannot be a conversion",
+                    nameTok.origin());
+        }
+        if (params.size() != 1) {
+            throw new ParseException("a conductor handler reacts to exactly one event — declare a "
+                    + "single parameter; got " + params.size(), nameTok.origin());
+        }
+        expect(CardinalToken.Kind.ARROW);
+        Map<String, IrSort> savedScope = new LinkedHashMap<>(currentScope);
+        currentScope.clear();
+        for (IrParam p : params) currentScope.put(p.name(), p.sort());
+        // `this` is in scope for the body so `this.field.method(…)` parses as a value-receiver MethodCall
+        // (not a dotted Call) — its concrete state sort is patched in by parseConductor afterward.
+        currentScope.put("this", IrSort.named("_"));
+        bindParamDestructures(destrs);
+        boolean savedInConductor = inConductorHandler;
+        inConductorHandler = true;   // enables `this.field = …` assignment in this body only
+        try {
+            IrExpr body = wrapParamDestructures(parseExpr(), destrs);
+            // A CONDUCTOR reaction — key encodes the owning conductor so the interpreter can bind
+            // its state cell as `this` while the reaction fires. `#caction#` deliberately does NOT
+            // contain the substring `#action#`, so the plain-action routing check skips it.
+            String key = "#caction#" + conductorName + "#" + (actionSeq++) + "#" + nameTok.text();
+            return new IrStmt.FunctionDecl(key, params, IrSort.named("_"), body, nameTok.origin());
+        } finally {
+            inConductorHandler = savedInConductor;
+            currentScope.clear();
+            currentScope.putAll(savedScope);
+        }
+    }
+
+    /**
+     * Parses a seating statement {@code spawn ConductorName [over TIER]} (docs/orchestration.md, §Seating).
+     * A bare seat is the {@code MAIN_LANE} (cooperative, synchronous); {@code over thread} is the
+     * same-process-thread tier. {@code over} is a CONTEXTUAL keyword (an IDENT), like {@code from}, so it
+     * never collides with a user name. Tiers beyond {@code thread} (process / host) are rejected until built.
+     */
+    private IrStmt parseSpawn() throws ParseException {
+        CardinalToken start = expectKeyword("spawn");
+        CardinalToken nameTok = expect(CardinalToken.Kind.IDENT);
+        CardinalToken end = nameTok;
+        IrStmt.Spawn.Placement placement = IrStmt.Spawn.Placement.MAIN_LANE;
+        if (peek().kind() == CardinalToken.Kind.IDENT && peek().text().equals("over")) {
+            consume();  // `over`
+            CardinalToken tier = expect(CardinalToken.Kind.IDENT);
+            placement = switch (tier.text()) {
+                case "thread" -> IrStmt.Spawn.Placement.THREAD;
+                default -> throw new ParseException(
+                        "unknown placement '" + tier.text() + "' — `spawn C over thread` is the only tier "
+                                + "built so far (process / host are not yet supported)", tier.origin());
+            };
+            end = tier;
+        }
+        return new IrStmt.Spawn(nameTok.text(), placement, start.spanTo(end));
+    }
+
+    /**
+     * Parses the {@code { member, ... }} brace block of a trait sort, after the
+     * head token. Used two ways: by {@link #parseTrait} for a named declaration
+     * ({@code trait NAME{...}}, name patched in afterward), and by the sort parser
+     * for the anonymous {@code Type{...}} sort literal usable in any sort position.
+     * A member is {@code name:[Method(...):Ret]} (a method), {@code name:Sort}
+     * (a data attribute), {@code op:[Dispatch(...)]} (an operator contract), or
+     * {@code type X[:Bound]} (an associated type). The returned
+     * {@link IrSort.Trait} has a placeholder name until a declaration patches it.
+     */
+    private IrSort.Trait parseTraitMembers(CardinalToken headTok) throws ParseException {
+        expect(CardinalToken.Kind.LBRACE);
+        Map<String, IrSort.CallSig> methods = new LinkedHashMap<>();
+        Map<String, IrSort> attributes = new LinkedHashMap<>();
+        // Default method bodies — member name → a body-bearing FunctionDecl, present
+        // only for a DEFAULTED method (`quack():Int -> this.x`). The same method also
+        // lands in `methods` as its IrSort.CallSig signature.
+        Map<String, IrStmt.FunctionDecl> methodDefaults = new LinkedHashMap<>();
+        // Return shells — member name → its trait-owned output transform `[C->D]`
+        // (docs/sort-transforms.md); present when a method's return is a clause-chain.
+        Map<String, IrExpr.Lambda> returnShells = new LinkedHashMap<>();
+        // Argument shells — member name → user-param POSITION → its trait-owned input
+        // transform `[A->B]` (docs/sort-transforms.md, slice 2); present when a method
+        // parameter is a conversion clause.
+        Map<String, Map<Integer, IrExpr.Lambda>> argShells = new LinkedHashMap<>();
+        // Associated types — member name → bound (null = unbounded `type X`; a
+        // sort = the bound `type X:R`). LinkedHashMap permits the null value.
+        Map<String, IrSort> associatedTypes = new LinkedHashMap<>();
+        // Operator contract members — `+:[Dispatch(this.type, this.type):this.type]`
+        // (dispatch-unification B1). Keyed by the operator symbol.
+        Map<String, IrSort.CallSig> operators = new LinkedHashMap<>();
+        boolean first = true;
+        while (atMemberBoundary(first, CardinalToken.Kind.RBRACE)) {
+            // An OPERATOR member key — `+:[Dispatch(this.type, this.type):this.type]`.
+            // The key is an operator symbol (not an identifier); the sort must be a
+            // homogeneous self-typed Dispatch (the v1 bound). This is a mechanism-1
+            // bound the compiler verifies at `assign trait`, not a hosted method.
+            if (peek().kind() == CardinalToken.Kind.OP) {
+                CardinalToken opTok = consume();
+                if (!OVERLOADABLE_OPS.contains(opTok.text())) {
+                    throw new ParseException(
+                            "'" + opTok.text() + "' is not an overloadable operator, so it "
+                                    + "cannot be a trait contract member", opTok.origin());
+                }
+                expect(CardinalToken.Kind.COLON);
+                IrSort opSort = parseSort();
+                if (!(opSort instanceof IrSort.CallSig dispatch)
+                        || CallKinds.builtin(dispatch.typeName()) != CallKinds.Kind.DISPATCH) {
+                    throw new ParseException(
+                            "Operator contract member '" + opTok.text() + "' must be a "
+                                    + "[Dispatch(...)] sort (e.g. "
+                                    + "[Dispatch(this.type, this.type):this.type]); operators "
+                                    + "are mechanism-1 bounds, never methods", opTok.origin());
+                }
+                requireHomogeneousSelfOperatorContract(opTok, dispatch);
+                if (methods.containsKey(opTok.text())
+                        || attributes.containsKey(opTok.text())
+                        || associatedTypes.containsKey(opTok.text())
+                        || operators.containsKey(opTok.text())) {
+                    throw new ParseException(
+                            "Duplicate member '" + opTok.text() + "' in trait body",
+                            opTok.origin());
+                }
+                operators.put(opTok.text(), dispatch);
+                first = false;
+                continue;
+            }
+            // `type X` / `type X:Bound` — an associated type declared with the
+            // `type` declarator (a type-level member, not a value member).
+            if (peek().kind() == CardinalToken.Kind.IDENT && peek().text().equals("type")) {
+                consume();  // `type`
+                CardinalToken varName = expect(CardinalToken.Kind.IDENT);
+                if (methods.containsKey(varName.text())
+                        || attributes.containsKey(varName.text())
+                        || associatedTypes.containsKey(varName.text())
+                        || operators.containsKey(varName.text())) {
+                    throw new ParseException(
+                            "Duplicate member '" + varName.text() + "' in trait body",
+                            varName.origin());
+                }
+                IrSort bound = null;
+                if (peek().kind() == CardinalToken.Kind.COLON) {
+                    consume();  // `:`
+                    bound = parseSort();   // the bound — `type X:R`
+                }
+                associatedTypes.put(varName.text(), bound);
+                first = false;
+                continue;
+            }
+            CardinalToken memberName = expect(CardinalToken.Kind.IDENT);
+            if (methods.containsKey(memberName.text())
+                    || attributes.containsKey(memberName.text())
+                    || associatedTypes.containsKey(memberName.text())
+                    || operators.containsKey(memberName.text())) {
+                throw new ParseException(
+                        "Duplicate member '" + memberName.text() + "' in trait body",
+                        memberName.origin());
+            }
+            // A method member written in impl-method form: `quack(params):Ret [-> body]`.
+            // A `(` after the name marks it (an abstract `:[Method…]` member or a data
+            // attribute uses `:` instead). The return may be a clause-chain SHELL, the
+            // body is optional (its presence = a default kernel; absence = abstract).
+            if (peek().kind() == CardinalToken.Kind.LPAREN) {
+                parseTraitMethodMember(memberName, methods, methodDefaults, returnShells, argShells);
+                first = false;
+                continue;
+            }
+            expect(CardinalToken.Kind.COLON);
+            IrSort memberSort = parseSort();
+            // A member's KIND is read from its sort's call-kind capability, not a keyword:
+            //   - a call signature ([Method(...):Ret], and the effectful [Action(...)] /
+            //     [Conduit(...):S] siblings) is a CALLABLE member, kept in `methods` keyed
+            //     by name — its typeName() (Method / Action / Conduit) preserves which kind
+            //     it is for downstream routing;
+            //   - anything else is a typed data ATTRIBUTE — a value sort the satisfier must
+            //     supply (a field or a computed producer).
+            // Both live in `Type{…}`. Crucially an Action/Conduit sort must be caught HERE,
+            // before the attribute fallthrough, or it would be silently misread as data.
+            if (memberSort instanceof IrSort.CallSig fn
+                    && isCallableMemberKind(CallKinds.builtin(fn.typeName()))) {
+                methods.put(memberName.text(), fn);
+            } else {
+                attributes.put(memberName.text(), memberSort);
+            }
+            first = false;
+        }
+        CardinalToken close = expect(CardinalToken.Kind.RBRACE);
+        // Placeholder name; parseTrait patches it with the declared name.
+        return new IrSort.Trait(
+                "_pending", methods, attributes, associatedTypes, Map.of(), operators,
+                null, List.of(), methodDefaults, returnShells, argShells, headTok.spanTo(close));
+    }
+
+    /**
+     * Whether a member sort's call-kind makes it a <em>callable</em> member (kept in the
+     * trait's {@code methods} map) rather than a data attribute. A {@code Method} contract
+     * and its effectful {@code Action} / {@code Conduit} siblings all qualify — the sort
+     * carries which kind it is (its {@code typeName()}), so routing stays available
+     * downstream without a data-model split at this slice. A {@code null} kind (not a
+     * recognized call-signature head) is not callable — it falls through to an attribute.
+     */
+    private static boolean isCallableMemberKind(CallKinds.Kind kind) {
+        return kind == CallKinds.Kind.FUNCTION
+                || kind == CallKinds.Kind.ACTION
+                || kind == CallKinds.Kind.CONDUIT;
+    }
+
+    /**
+     * Parses a trait method member in impl-method form: {@code name(params):Ret [-> body]}
+     * (decided by the {@code (} after the name; an abstract {@code :[Method…]} member or a
+     * data attribute uses {@code :} instead). Three independent dials:
+     * <ul>
+     *   <li><b>Return shell</b> — when the return is a clause-chain {@code [C -> … -> D]}
+     *       (docs/sort-transforms.md), callers see the terminus {@code D} (the contract
+     *       {@link IrSort.CallSig} returnSort), the kernel returns the domain {@code C}, and
+     *       the chain is stored in {@code returnShells} for TraitDefaultExpansion to wrap
+     *       the kernel with. A plain sort = no shell (kernel return == contract return).</li>
+     *   <li><b>Default body</b> — a trailing {@code -> body} makes it a DEFAULT kernel
+     *       (stored in {@code methodDefaults}); its absence leaves the method abstract
+     *       (the impl supplies the kernel).</li>
+     * </ul>
+     *   <li><b>Argument shell</b> — a conversion-clause param {@code p:[A -> … -> B]}: the
+     *       caller passes the domain {@code A} (the contract param sort), the kernel sees the
+     *       codomain {@code B}; stored by user-param POSITION in {@code argShells}, applied at
+     *       expansion (the impl may rename the param, so position not name).</li>
+     * The injected {@code this} param is typed to {@link IrSort#SELF_TYPE}; expansion
+     * substitutes it to each satisfier's concrete type and qualifies the name.
+     */
+    private void parseTraitMethodMember(
+            CardinalToken nameTok,
+            Map<String, IrSort.CallSig> methods,
+            Map<String, IrStmt.FunctionDecl> methodDefaults,
+            Map<String, IrExpr.Lambda> returnShells,
+            Map<String, Map<Integer, IrExpr.Lambda>> argShells) throws ParseException {
+        if (KEYWORDS.contains(nameTok.text())) {
+            throw new ParseException(
+                    "Cannot use keyword '" + nameTok.text() + "' as a method name",
+                    nameTok.origin());
+        }
+        expect(CardinalToken.Kind.LPAREN);
+        List<IrParam> userParams = parseParamList(CardinalToken.Kind.RPAREN);
+        expect(CardinalToken.Kind.RPAREN);
+        List<ParamDestructure> destrs = drainParamDestructures();
+        // Argument shells: a conversion-clause param `p:[A -> B]` keeps the contract sort
+        // at the DOMAIN A (parseParamList already set it) — the trait owns the transform.
+        // Capture each by user-param POSITION (the impl may rename the param) for expansion
+        // to wrap; the kernel sees the CODOMAIN B.
+        List<ParamConversion> convs = drainParamConversions();
+        Map<Integer, IrExpr.Lambda> shellsByPos = new LinkedHashMap<>();
+        Map<String, IrSort> codomainByName = new LinkedHashMap<>();
+        for (ParamConversion c : convs) {
+            for (int i = 0; i < userParams.size(); i++) {
+                if (userParams.get(i).name().equals(c.paramName())) {
+                    shellsByPos.put(i, c.clause());
+                    codomainByName.put(c.paramName(), paramConversionCodomain(c));
+                    break;
+                }
+            }
+        }
+        if (!shellsByPos.isEmpty()) {
+            argShells.put(nameTok.text(), shellsByPos);
+        }
+        expect(CardinalToken.Kind.COLON);
+        // The return may be a clause-chain SHELL `[C -> … -> D]`: the contract return
+        // (what callers/dispatch see) is the terminus D; the kernel returns the domain C.
+        ReturnClause rc = parseReturnClause();
+        IrSort contractReturn = rc.sort();
+        // The `()` already declares this a method: its return must be a plain VALUE
+        // sort, never a `[Method(...)]`/`[Action(...)]`/`[Conduit(...)]` call-signature.
+        // Writing `name():[Method(...):Ret]` doubly wraps it — the two surface forms are
+        // mutually exclusive (`name(...):Ret` with parens, or `name:[Method(...):Ret]`
+        // without). Reject the combination here rather than storing a nonsense return.
+        if (contractReturn instanceof IrSort.CallSig csRet
+                && isCallableMemberKind(CallKinds.builtin(csRet.typeName()))) {
+            throw new ParseException(
+                    "Method '" + nameTok.text() + "' opens with `()` but its return is a `["
+                            + csRet.typeName() + "(...)]` sort — the `()` already declares a "
+                            + "method, so its return must be a plain value sort. Drop the `()` "
+                            + "for the abstract form `" + nameTok.text() + ":[" + csRet.typeName()
+                            + "(...):Ret]`, or drop the `[" + csRet.typeName() + "(...)]` wrapper "
+                            + "for the parens form `" + nameTok.text() + "(...):Ret`.",
+                    nameTok.origin());
+        }
+        IrSort kernelReturn = rc.transform() != null
+                ? rc.transform().params().get(0).sort()
+                : rc.sort();
+        if (rc.transform() != null) {
+            returnShells.put(nameTok.text(), rc.transform());
+        }
+
+        // Contract signature EXCLUDES `this` (SortChecker prepends it) — same shape an
+        // abstract `:[Method(...)]` member yields.
+        List<IrSort> paramSorts = new ArrayList<>(userParams.size());
+        List<String> paramNames = new ArrayList<>(userParams.size());
+        for (IrParam p : userParams) {
+            paramSorts.add(p.sort());
+            paramNames.add(p.name());
+        }
+        methods.put(nameTok.text(),
+                new IrSort.CallSig(IrSort.CallSig.METHOD, paramSorts, paramNames,
+                        contractReturn, nameTok.origin()));
+        declaredFunctionReturns.put(nameTok.text(), contractReturn);
+
+        // Body OPTIONAL: `-> expr` is a default kernel (returning the inner face C);
+        // its absence leaves the method abstract (the impl supplies the kernel).
+        if (peek().kind() != CardinalToken.Kind.ARROW) {
+            return;
+        }
+        expect(CardinalToken.Kind.ARROW);
+
+        // The default kernel sees the INNER faces: shelled params at their codomain B
+        // (not the domain A the contract carries), the return at the shell's domain C.
+        // Expansion wraps it (params B→A + `let p = shell(p)`, plus the return shell)
+        // uniformly with impl-provided kernels.
+        IrSort selfSort = IrSort.named(IrSort.SELF_TYPE);
+        List<IrParam> allParams = new ArrayList<>(userParams.size() + 1);
+        allParams.add(new IrParam("this", selfSort));
+        for (IrParam p : userParams) {
+            IrSort codomain = codomainByName.get(p.name());
+            allParams.add(codomain == null ? p : new IrParam(p.name(), codomain));
+        }
+
+        Map<String, IrSort> savedScope = new LinkedHashMap<>(currentScope);
+        currentScope.clear();
+        for (IrParam p : allParams) currentScope.put(p.name(), p.sort());
+        bindParamDestructures(destrs);
+        try {
+            IrExpr body = wrapParamDestructures(parseExpr(), destrs);
+            // Body-bearing decl — name is the SHORT method name, return is the kernel
+            // inner face C (the shell, if any, wraps it at expansion); expansion
+            // qualifies the name and re-types `this`.
+            methodDefaults.put(nameTok.text(), new IrStmt.FunctionDecl(
+                    nameTok.text(), allParams, kernelReturn, body, nameTok.origin()));
+        } finally {
+            currentScope.clear();
+            currentScope.putAll(savedScope);
+        }
+    }
+
+    /**
+     * Enforces the v1 scope for an operator contract member: a <b>homogeneous,
+     * self-typed</b> binary dispatch — {@code (this.type, this.type):this.type}.
+     * Mixed-operand / promotion contracts (e.g. {@code (this.type, Int)}) are a
+     * later slice; until then they fail here with a clear error rather than being
+     * silently stored and ignored (no verifier consumes them yet).
+     */
+    private void requireHomogeneousSelfOperatorContract(CardinalToken opTok, IrSort.CallSig d)
+            throws ParseException {
+        boolean homogeneous = d.paramSorts().size() == 2
+                && isSelfType(d.paramSorts().get(0))
+                && isSelfType(d.paramSorts().get(1))
+                && isSelfType(d.returnSort());
+        if (!homogeneous) {
+            throw new ParseException(
+                    "Operator contract member '" + opTok.text() + "' must be homogeneous over "
+                            + "the self type — [Dispatch(this.type, this.type):this.type]. "
+                            + "Mixed-operand or promotion contracts are not supported yet.",
+                    opTok.origin());
+        }
+    }
+
+    private IrSort parseBracketSort() throws ParseException {
+        CardinalToken open = expect(CardinalToken.Kind.LBRACKET);
+        CardinalToken first = peek();
+
+        // Tuple sort: `[{S0, S1, ...}]` — an anonymous positional aggregate.
+        // A leading `{` is unambiguous (the contextual `[pred]` form below never
+        // starts with it). Lowers onto the record substrate as a structural sort
+        // named "_tuple" with positional keys _0.._n. (BRACE-AGGREGATES WAR: the
+        // paren form `[(S0, S1)]` is retired.)
+        if (first.kind() == CardinalToken.Kind.LBRACE) {
+            IrSort tuple = parseTupleSortBody(open);
+            expect(CardinalToken.Kind.RBRACKET);
+            return tuple;
+        }
+
+        // Contextual form: `[pred]` — no base, take from contextualBaseStack
+        // (pushed by parseMatch when the scrutinee has an inferable sort).
+        if (first.kind() != CardinalToken.Kind.IDENT
+                && first.kind() != CardinalToken.Kind.LBRACKET) {
+            String inferredBase = contextualBaseStack.isEmpty()
+                    ? null
+                    : contextualBaseStack.peek();
+            if (inferredBase == null || inferredBase.isEmpty()) {
+                throw new ParseException(
+                        "Bracket-sort starts with " + first.kind() + " '" + first.text()
+                                + "' but no contextual base is available — write [Base:pred] explicitly",
+                        first.origin());
+            }
+            IrExpr pred = parseExpr();
+            CardinalToken close = expect(CardinalToken.Kind.RBRACKET);
+            IrExpr cooked = applyPredicateSugar(pred);
+            return new IrSort.Refined(inferredBase, cooked, open.spanTo(close));
+        }
+
+        // Parse the first branch. Could be a nested `[...]` or a bare
+        // ident with optional refinement / struct / function tail.
+        IrSort firstBranch = parseBracketBranch();
+
+        // Sort-level `|` or `&` between branches?
+        if (peek().kind() == CardinalToken.Kind.OP
+                && (peek().text().equals("|") || peek().text().equals("&"))) {
+            String op = consume().text();
+            List<IrSort> branches = new ArrayList<>();
+            branches.add(firstBranch);
+            branches.add(parseBracketBranch());
+            while (peek().kind() == CardinalToken.Kind.OP && peek().text().equals(op)) {
+                consume();
+                branches.add(parseBracketBranch());
+            }
+            CardinalToken close = expect(CardinalToken.Kind.RBRACKET);
+            return normalizeMultiBranch(branches, op, open.spanTo(close));
+        }
+
+        CardinalToken close = expect(CardinalToken.Kind.RBRACKET);
+        return firstBranch;
+    }
+
+    /**
+     * Parses a single sort element that can appear as a branch inside a
+     * bracket-sort's {@code |}/{@code &}-joined list. Either a nested
+     * {@code [...]} form (recurse) or a bare ident with optional
+     * refinement, struct-fields, or function-sort tail.
+     */
+    private IrSort parseBracketBranch() throws ParseException {
+        if (peek().kind() == CardinalToken.Kind.LBRACKET) {
+            return parseBracketSort();
+        }
+        CardinalToken baseTok = expect(CardinalToken.Kind.IDENT);
+
+        // Optional parametric application on the base — `Literal[Int]` inside a
+        // bracket sort (docs/type-parameters.md §2.3): an is-a base
+        // `[Literal[Int]]` (bare) or `[Literal[Int]:@.value==value]` (with the
+        // demotion morphism). The args are sorts, parsed with `parseTypeArg` so
+        // the bare-refined shorthand (`Stream[Int:0<=@<10]`) composes here too —
+        // matching the top-level parametric path (parseSort, `Name[arg, …]`).
+        // Without it, a refined Stream type-arg only parsed at the top level, so
+        // wrapping it in any bracket sort (`[Stream[Int:pred]|Nothing]`) failed.
+        List<IrSort> typeArgs = new ArrayList<>();
+        if (peek().kind() == CardinalToken.Kind.LBRACKET) {
+            expect(CardinalToken.Kind.LBRACKET);
+            boolean firstArg = true;
+            while (peek().kind() != CardinalToken.Kind.RBRACKET) {
+                if (!firstArg) expect(CardinalToken.Kind.COMMA);
+                typeArgs.add(parseTypeArg());
+                firstArg = false;
+            }
+            expect(CardinalToken.Kind.RBRACKET);
+        }
+
+        if (peek().kind() == CardinalToken.Kind.COLON) {
+            consume();
+            IrExpr pred = parseExpr();
+            IrExpr cooked = applyPredicateSugar(pred);
+            return new IrSort.Refined(baseTok.text(), typeArgs, cooked, baseTok.origin());
+        }
+
+        if (typeArgs.isEmpty() && peek().kind() == CardinalToken.Kind.LPAREN) {
+            // Call-signature vs struct is PURELY SYNTACTIC (docs/dispatch-method-elimination.md
+            // §2): `Name(…):Return` (a `:` after the matching `)`) is a call signature whose
+            // head name is DATA; `Name(…)` with no trailing `:` is a struct. No `Method`/
+            // `Dispatch` keyword branch — the head type's call-kind capability is resolved
+            // downstream, never here.
+            if (callSigColonFollows()) {
+                return parseCallSigBody(baseTok);
+            }
+            consume();  // LPAREN
+            java.util.Set<String> literalFields = new java.util.LinkedHashSet<>();
+            Map<String, String> renames = new LinkedHashMap<>();
+            Map<String, IrSort> members =
+                    parseStructFields(baseTok.text(), baseTok.origin(), literalFields, renames);
+            expect(CardinalToken.Kind.RPAREN);
+            IrSort.Structural structural = new IrSort.Structural(baseTok.text(), members, baseTok.origin());
+            if (!literalFields.isEmpty()) {
+                literalConstrainedFields.put(structural, literalFields);
+            }
+            if (!renames.isEmpty()) {
+                destructureRenames.put(structural, renames);
+            }
+            // Imported struct: shape unknown at parse time — mark deferred so the
+            // binding desugar is left to the post-link DestructureResolver.
+            if (patternShapeFor(baseTok.text()) == null) {
+                deferredStructPatterns.add(structural);
+            }
+            return structural;
+        }
+
+        // Bare name — `Int`, `Bool`, etc. — or a parametric application
+        // `Literal[Int]` (typeArgs non-empty).
+        return new IrSort.Named(baseTok.text(), typeArgs, baseTok.origin());
+    }
+
+    /**
+     * Parses a tuple sort/pattern body {@code (E0, E1, ...)} — the enclosing
+     * {@code [} is already consumed (passed as {@code open}); the {@code (} is
+     * the current token. In a <b>type</b> position each element is a sort; in a
+     * destructure/match <b>pattern</b> (signalled by {@link #parsingTuplePattern})
+     * each element is a positional binder ident or {@code _} discard. Either
+     * way the result is a structural sort named {@code "_tuple"} with positional
+     * keys {@code _0 .. _n}. For patterns, binder names go into
+     * {@link #destructureRenames} and {@code _} discards into
+     * {@link #literalConstrainedFields} (the "occupies the slot, binds nothing"
+     * set, verdict C), and member sorts are left as the {@code "_"} placeholder
+     * to be resolved from the scrutinee. Arity must be >= 2.
+     */
+    /**
+     * Parses a match/destructure pattern — a sort, but with
+     * {@link #parsingTuplePattern} set so a tuple {@code (a, b)} reads its
+     * elements as positional binders / {@code _} discards rather than as
+     * component sorts. A constructor component ({@code (Traction(n,z), …)})
+     * nests and binds via the recursive destructure desugar; a nested bare
+     * tuple component still occupies-but-binds-nothing. Restores the flag after.
+     */
+    private IrSort parsePattern() throws ParseException {
+        boolean prev = parsingTuplePattern;
+        parsingTuplePattern = true;
+        try {
+            return parseSort();
+        } finally {
+            parsingTuplePattern = prev;
+        }
+    }
+
+    /**
+     * Verdict B for tuples: a tuple destructure pattern must match the
+     * scrutinee's arity exactly — a pattern with fewer slots would silently
+     * drop components (lying by omission), which the structural matcher's
+     * width-subtyping would otherwise allow. Checked only when the scrutinee's
+     * tuple arity is statically known; an unknown scrutinee sort can't be
+     * checked here and falls to the runtime matcher.
+     */
+    private void checkTupleArity(IrExpr scrutinee, IrSort pattern) throws ParseException {
+        if (!(pattern instanceof IrSort.Structural sp) || !TUPLE_SENTINEL.equals(sp.name())) {
+            return;
+        }
+        if (inference.maximalSort(scrutinee) instanceof IrSort.Structural ss
+                && TUPLE_SENTINEL.equals(ss.name())
+                && ss.members().size() != sp.members().size()) {
+            throw new ParseException(
+                    "Tuple pattern has " + sp.members().size() + " slot(s) but the value is a "
+                            + ss.members().size() + "-tuple — a positional pattern must match every "
+                            + "slot; use '_' to discard the unwanted ones (e.g. [(a, _, c)]).",
+                    sp.origin());
+        }
+    }
+
+    private IrSort parseTupleSortBody(CardinalToken open) throws ParseException {
+        // BRACE-AGGREGATES WAR: a tuple sort/pattern is delimited by braces
+        // (`{Int, Int}`, `{a, b}`) — the paren form (`(Int, Int)`) is still
+        // accepted during migration. The delimiter is read from the actual open
+        // token (the `open` param is the enclosing `[` at the bracket-sort call
+        // site, so it can't be used here — peek() is the real `(`/`{`).
+        CardinalToken.Kind openKind = peek().kind();
+        CardinalToken.Kind closeKind = openKind == CardinalToken.Kind.LBRACE
+                ? CardinalToken.Kind.RBRACE : CardinalToken.Kind.RPAREN;
+        expect(openKind);
+        Map<String, IrSort> members = new LinkedHashMap<>();
+        java.util.Set<String> discards = new java.util.LinkedHashSet<>();
+        Map<String, String> renames = new LinkedHashMap<>();
+        int index = 0;
+        boolean first = true;
+        while (peek().kind() != closeKind) {
+            if (!first) expect(CardinalToken.Kind.COMMA);
+            String key = "_" + index;
+            // Narrow-in-place binder `name:Sort` — the third cell of the
+            // tuple-component grid, valid in BOTH match/type position (a match
+            // arm's tuple body parses in type position) and destructure-pattern
+            // position. It tests the component's sort AND binds the WHOLE
+            // (narrowed) value: the conditional-cast form. The member sort drives
+            // the per-component test (like a bare `[Int:@>0]` component); the
+            // rename drives the bind (like a bare `a` binder). Distinct from
+            // `Sort(fields)`, which opens the value UP into its fields, and from
+            // bare `a`, which binds whole but tests nothing. A leading `IDENT :`
+            // is unambiguous here — no other tuple-component form starts that way.
+            // The sort after `:` is a type, so read it with the pattern flag off.
+            if (peek().kind() == CardinalToken.Kind.IDENT
+                    && !peek().text().equals("_")
+                    && peek(1).kind() == CardinalToken.Kind.COLON) {
+                CardinalToken binder = consume();
+                consume();  // ':'
+                boolean prevPat = parsingTuplePattern;
+                parsingTuplePattern = false;
+                IrSort narrowed;
+                try {
+                    narrowed = memberSort();
+                } finally {
+                    parsingTuplePattern = prevPat;
+                }
+                members.put(key, narrowed);
+                renames.put(key, binder.text());
+                index++;
+                first = false;
+                continue;
+            }
+            if (parsingTuplePattern) {
+                CardinalToken t = peek();
+                boolean literalClause = t.kind() == CardinalToken.Kind.INTEGER
+                        || t.kind() == CardinalToken.Kind.DECIMAL
+                        || t.kind() == CardinalToken.Kind.CHAR
+                        || (t.kind() == CardinalToken.Kind.IDENT
+                                && (t.text().equals("true") || t.text().equals("false")));
+                if (literalClause) {
+                    // A value constraint in place ([(0.0, 0.0)], [(0, y)]) — like a
+                    // struct's positional literal field ([Point(0, y)]). The base
+                    // comes from the literal's own kind; the slot is occupied but
+                    // binds nothing (verdict C).
+                    consume();
+                    String base = switch (t.kind()) {
+                        case INTEGER -> "Int";
+                        case DECIMAL -> "Decimal";
+                        case CHAR -> "Char";
+                        default -> "Bool";
+                    };
+                    IrExpr lit = switch (t.kind()) {
+                        case INTEGER -> new IrExpr.Lit(Long.parseLong(t.text()), t.origin());
+                        case DECIMAL -> new IrExpr.Dec(new java.math.BigDecimal(t.text()), t.origin());
+                        case CHAR -> new IrExpr.Chr(t.text().codePointAt(0), t.origin());
+                        default -> new IrExpr.Bool(t.text().equals("true"), t.origin());
+                    };
+                    members.put(key, new IrSort.Refined(base,
+                            new IrExpr.BinOp(IrExpr.Op.EQ, new IrExpr.SelfRef(t.origin()), lit, t.origin()),
+                            t.origin()));
+                    discards.add(key);
+                } else if (t.kind() == CardinalToken.Kind.IDENT
+                        && peek(1).kind() == CardinalToken.Kind.LPAREN) {
+                    // A constructor/struct destructure as a tuple element
+                    // ([(Traction(n, z), Traction(0.0, 0.0))]) — reuse the
+                    // bracket-branch struct-pattern machinery. The slot is
+                    // occupied by the nested Structural sort; its inner fields
+                    // bind via the recursive destructure desugar (the renames /
+                    // literal constraints are recorded against the inner sort).
+                    // NOT a tuple-level discard — the nested pattern binds.
+                    CardinalToken baseTok = consume();
+                    expect(CardinalToken.Kind.LPAREN);
+                    java.util.Set<String> innerLiterals = new java.util.LinkedHashSet<>();
+                    Map<String, String> innerRenames = new LinkedHashMap<>();
+                    Map<String, IrSort> innerMembers = parseStructFields(
+                            baseTok.text(), baseTok.origin(), innerLiterals, innerRenames);
+                    expect(CardinalToken.Kind.RPAREN);
+                    IrSort.Structural inner = new IrSort.Structural(
+                            baseTok.text(), innerMembers, baseTok.origin());
+                    if (!innerLiterals.isEmpty()) literalConstrainedFields.put(inner, innerLiterals);
+                    if (!innerRenames.isEmpty()) destructureRenames.put(inner, innerRenames);
+                    // An imported struct inside a tuple ([(Vec(x,y), c)]) defers
+                    // like any other — its slots are positional until link time.
+                    if (patternShapeFor(baseTok.text()) == null) deferredStructPatterns.add(inner);
+                    members.put(key, inner);
+                } else if (t.kind() == CardinalToken.Kind.LBRACKET) {
+                    // An explicit refinement-sort constraint ([Decimal:0.0],
+                    // [Int:@>0]) — occupies the slot, binds nothing.
+                    members.put(key, parseSort());
+                    discards.add(key);
+                } else if (t.kind() == CardinalToken.Kind.LBRACE) {
+                    // A nested tuple ([{{a, b}, c}]) — binds its components via
+                    // the recursive destructure desugar; NOT a discard.
+                    members.put(key, parseTupleSortBody(t));
+                } else {
+                    CardinalToken binder = expect(CardinalToken.Kind.IDENT);
+                    members.put(key, IrSort.named("_"));  // sort resolved from scrutinee
+                    if (binder.text().equals("_")) {
+                        discards.add(key);                // verdict C: explicit discard
+                    } else {
+                        renames.put(key, binder.text());
+                    }
+                }
+            } else {
+                // Type position: a member sort, optionally REPEATED as `T*N` or `N*T`
+                // (e.g. {Decimal*3}, {2*{2*Decimal}}) — expands to N positional members. The
+                // count is whichever operand is the integer, so the order is free and unambiguous.
+                int repeat = 1;
+                IrSort memberSort;
+                if (peek().kind() == CardinalToken.Kind.INTEGER && isStar(peek(1))) {
+                    repeat = repeatCount(consume());
+                    consume();  // '*'
+                    memberSort = memberSort();
+                } else {
+                    memberSort = memberSort();
+                    if (isStar(peek()) && peek(1).kind() == CardinalToken.Kind.INTEGER) {
+                        consume();  // '*'
+                        repeat = repeatCount(consume());
+                    }
+                }
+                for (int r = 0; r < repeat; r++) {
+                    members.put("_" + index, memberSort);
+                    index++;
+                }
+                first = false;
+                continue;
+            }
+            index++;
+            first = false;
+        }
+        expect(closeKind);
+        if (peek().kind() == CardinalToken.Kind.COLON) {
+            // A tuple takes no whole-aggregate predicate — by design, not by
+            // omission. An independent per-component constraint belongs in
+            // place ([([Int:@>0], Bool)]). A constraint that *relates* two
+            // components is a relationship, and a relationship is a named
+            // concept: that's a struct, with fields referred to by name
+            // ([Interval:@.lo <= @.hi]). Tuples are for unrelated data.
+            throw new ParseException(
+                    "A tuple sort takes no whole-aggregate predicate. Constrain a component "
+                            + "in place — [([Int:@>0], Bool)]. If the components are related by an "
+                            + "invariant, that relationship is a named concept — use a struct and "
+                            + "refer to fields by name, e.g. [Interval:@.lo <= @.hi].",
+                    peek().origin());
+        }
+        if (members.isEmpty()) {
+            throw new ParseException(
+                    "An empty tuple sort '()' is not yet supported (the empty/single-element "
+                            + "tuple slice is backlogged, docs/stream-war.md §7.10).",
+                    open.origin());
+        }
+        if (members.size() == 1) {
+            // `(S)` is GROUPING, not a 1-tuple — the parenthesized single sort IS S,
+            // mirroring the value side where `(x)` is grouping (RULED James 2026-06-22:
+            // a 1-tuple is the trailing-comma `(S,)`, a separate §7.10 slice). This makes
+            // `[(Int)->Int]` read as `[Int->Int]` — a parenthesized domain, not a 1-tuple.
+            return members.values().iterator().next();
+        }
+        IrSort.Structural tuple = new IrSort.Structural(TUPLE_SENTINEL, members, open.origin());
+        if (!discards.isEmpty()) literalConstrainedFields.put(tuple, discards);
+        if (!renames.isEmpty()) destructureRenames.put(tuple, renames);
+        return tuple;
+    }
+
+    /** A tuple member sort in type position: a nested tuple ({@code {…}}) or any other sort. */
+    private IrSort memberSort() throws ParseException {
+        return peek().kind() == CardinalToken.Kind.LBRACE ? parseTupleSortBody(peek()) : parseSort();
+    }
+
+    /** Whether {@code t} is the {@code *} operator (the tuple-repetition marker). */
+    /** Parses a tuple-repetition count ({@code N} in {@code {T*N}}) — an integer literal ≥ 1. */
+    private int repeatCount(CardinalToken intTok) throws ParseException {
+        int n;
+        try {
+            n = Integer.parseInt(intTok.text());
+        } catch (NumberFormatException e) {
+            throw new ParseException(
+                    "A tuple repetition count must be an integer literal, got '" + intTok.text() + "'",
+                    intTok.origin());
+        }
+        if (n < 1) {
+            throw new ParseException(
+                    "A tuple repetition count must be at least 1, got " + n, intTok.origin());
+        }
+        return n;
+    }
+
+    /**
+     * Builds the canonical IR shape for a multi-branch bracket-sort.
+     * Same-base branches (all bare or refined over the same base name)
+     * collapse to a single {@link IrSort.Refined} with an {@code OR}-joined
+     * or {@code AND}-joined predicate. Cross-base branches stay as a
+     * {@link IrSort.Union} or {@link IrSort.Intersection}.
+     */
+    private static IrSort normalizeMultiBranch(List<IrSort> branches, String op, Origin origin) {
+        String commonBase = sameBaseName(branches);
+        if (commonBase == null) {
+            return op.equals("|")
+                    ? new IrSort.Union(branches, origin)
+                    : new IrSort.Intersection(branches, origin);
+        }
+        IrExpr.Op irOp = op.equals("|") ? IrExpr.Op.OR : IrExpr.Op.AND;
+        IrExpr combined = null;
+        for (IrSort b : branches) {
+            IrExpr branchPred = b instanceof IrSort.Refined r
+                    ? r.predicate()
+                    : new IrExpr.Bool(true, b.origin());
+            combined = combined == null
+                    ? branchPred
+                    : new IrExpr.BinOp(irOp, combined, branchPred, origin);
+        }
+        return new IrSort.Refined(commonBase, combined, origin);
+    }
+
+    /**
+     * Returns the shared base-name across {@code branches} if all are
+     * either bare {@link IrSort.Named} or {@link IrSort.Refined} over the
+     * same name; null otherwise (signals cross-base — caller emits Union
+     * or Intersection instead of normalizing).
+     */
+    /**
+     * Whether {@code peek()} — an opening {@code (} of a {@code Name(…)} group — is the
+     * start of a <b>call signature</b> {@code Name(…):Return} rather than a struct
+     * {@code Name(…)}. Purely syntactic: scan to the matching {@code )} and report whether
+     * a {@code :} follows it at paren-depth 0 (docs/dispatch-method-elimination.md §2).
+     */
+    private boolean callSigColonFollows() {
+        int depth = 0;
+        for (int i = 0; ; i++) {
+            CardinalToken.Kind k = peek(i).kind();
+            if (k == CardinalToken.Kind.EOF) return false;
+            if (k == CardinalToken.Kind.LPAREN || k == CardinalToken.Kind.LBRACKET
+                    || k == CardinalToken.Kind.LBRACE) {
+                depth++;
+            } else if (k == CardinalToken.Kind.RPAREN || k == CardinalToken.Kind.RBRACKET
+                    || k == CardinalToken.Kind.RBRACE) {
+                depth--;
+                if (depth == 0) return peek(i + 1).kind() == CardinalToken.Kind.COLON;
+            }
+        }
+    }
+
+    /**
+     * Parses a call signature {@code Head(P1, P2, ...):R} — the head token is already
+     * consumed (passed as {@code headTok}); the {@code (} is the current token. The head
+     * NAME is data ({@code Method}, {@code Dispatch}, or any callable type); the sort's
+     * call-kind behavior is decided downstream by capability, never by this name. Each
+     * parameter is positional ({@code Int}) or named ({@code i:Int}); a sort is all-named
+     * or all-positional (mixing is an error). Named parameters are the binders a dependent
+     * return/param sort references (WAR(dependent-sorts)).
+     */
+    private IrSort.CallSig parseCallSigBody(CardinalToken headTok) throws ParseException {
+        expect(CardinalToken.Kind.LPAREN);
+        List<IrSort> paramSorts = new ArrayList<>();
+        List<String> paramNames = new ArrayList<>();
+        int named = 0;
+        boolean first = true;
+        while (peek().kind() != CardinalToken.Kind.RPAREN) {
+            if (!first) expect(CardinalToken.Kind.COMMA);
+            if (peek().kind() == CardinalToken.Kind.IDENT
+                    && peek(1).kind() == CardinalToken.Kind.COLON) {
+                paramNames.add(expect(CardinalToken.Kind.IDENT).text());
+                expect(CardinalToken.Kind.COLON);
+                named++;
+            } else {
+                paramNames.add("");  // positional placeholder (dropped unless all named)
+            }
+            paramSorts.add(parseSort());
+            first = false;
+        }
+        expect(CardinalToken.Kind.RPAREN);
+        expect(CardinalToken.Kind.COLON);
+        IrSort returnSort = parseSort();
+        if (named != 0 && named != paramSorts.size()) {
+            throw new ParseException(
+                    "'" + headTok.text() + "' call signature mixes named and positional "
+                            + "parameters — name all of them or none.", headTok.origin());
+        }
+        List<String> names = named == 0 ? List.of() : paramNames;
+        return new IrSort.CallSig(headTok.text(), paramSorts, names, returnSort, headTok.origin());
+    }
+
+    /**
+     * Parses the comma-separated clause list inside {@code [Name(...)]}:
+     *   - {@code field:Sort} — explicit per-field sort
+     *   - {@code field}      — bare ident; sort looked up from {@link #types}
+     *   - a <b>literal</b> ({@code 0}, {@code 1.5}, {@code true}) — positional:
+     *     the i-th clause maps to the i-th declared field, constraining it to
+     *     {@code [@==literal]} without binding it ({@code [Ternion(z, 0, w)]}).
+     *     Primitive-sorted fields only; names added to {@code literalFieldsOut}.
+     * Mixed forms are allowed.
+     */
+    /**
+     * The shape a {@code [Name(...)]} pattern destructures against: the
+     * declared struct, or a native constructor's registered anatomy
+     * ({@code [Decimal(u, s)]} — irrefutable, every Decimal has a canonical
+     * (unscaled, scale)).
+     */
+    private IrSort.Structural patternShapeFor(String typeName) {
+        // Struct OR native constructor — the one shape query that admits built-ins (the catalog's
+        // shapeOf answers both, so the former explicit NativeConstructors fallback is subsumed).
+        return types.shapeOf(typeName).orElse(null);
+    }
+
+    /**
+     * Resolves the declared field name at positional {@code clauseIndex} of a
+     * struct pattern, with the standard guards (struct declared, index in range,
+     * slot not already given by name). Shared by the positional clauses that
+     * occupy a slot without a leading field name — nested patterns and
+     * refinement constraints.
+     */
+    private String positionalField(
+            String typeName, int clauseIndex, Map<String, IrSort> members, Origin o)
+            throws ParseException {
+        IrSort.Structural decl = patternShapeFor(typeName);
+        if (decl == null) {
+            throw new ParseException(
+                    "A positional pattern inside [" + typeName + "(...)] requires '"
+                            + typeName + "' to be declared before this point", o);
+        }
+        List<String> order = new ArrayList<>(decl.constructorMembers().keySet());
+        if (clauseIndex >= order.size()) {
+            throw new ParseException(
+                    "Too many fields for struct '" + typeName + "' ("
+                            + order.size() + " declared)", o);
+        }
+        String posField = order.get(clauseIndex);
+        if (members.containsKey(posField)) {
+            throw new ParseException(
+                    "Field '" + posField + "' is given both by name and by position in ["
+                            + typeName + "(...)]", o);
+        }
+        return posField;
+    }
+
+    private Map<String, IrSort> parseStructFields(String typeName, Origin typeOrigin,
+            java.util.Set<String> literalFieldsOut, Map<String, String> renamesOut)
+            throws ParseException {
+        Map<String, IrSort> members = new LinkedHashMap<>();
+        boolean first = true;
+        int clauseIndex = -1;
+        // Cluster (2) deferral: a struct imported from another module is not in
+        // declaredStructs at parse time (requires-linking runs later), so its
+        // field ORDER and SORTS are unknown here. Rather than throw (the old
+        // per-form seam), capture the positional pattern SYMBOLICALLY — slot
+        // keys `_0.._n`, the binder/discard/literal role encoded in each slot's
+        // sort — and let the post-link DestructureResolver map slots to declared
+        // field names and run the arity-total check. This mirrors how the `.{}`
+        // by-name form already defers (IrSort.named("_") placeholders), adding
+        // the slot ORDER positional forms need. The local (struct-known) path is
+        // unchanged below.
+        boolean deferred = patternShapeFor(typeName) == null;
+        while (atMemberBoundary(first, CardinalToken.Kind.RPAREN)) {
+            clauseIndex++;
+            CardinalToken t = peek();
+            boolean literalClause = t.kind() == CardinalToken.Kind.INTEGER
+                    || t.kind() == CardinalToken.Kind.DECIMAL
+                    || t.kind() == CardinalToken.Kind.CHAR
+                    || (t.kind() == CardinalToken.Kind.IDENT
+                            && (t.text().equals("true") || t.text().equals("false")));
+            if (deferred) {
+                parseDeferredStructFieldClause(
+                        typeName, clauseIndex, members, literalFieldsOut, renamesOut, literalClause);
+                first = false;
+                continue;
+            }
+            if (literalClause) {
+                consume();
+                IrSort.Structural decl = patternShapeFor(typeName);
+                if (decl == null) {
+                    throw new ParseException(
+                            "A literal field pattern inside [" + typeName + "(...)] requires '"
+                                    + typeName + "' to be declared before this point",
+                            t.origin());
+                }
+                List<String> order = new ArrayList<>(decl.constructorMembers().keySet());
+                if (clauseIndex >= order.size()) {
+                    throw new ParseException(
+                            "Too many fields for struct '" + typeName + "' ("
+                                    + order.size() + " declared)", t.origin());
+                }
+                String posField = order.get(clauseIndex);
+                if (members.containsKey(posField)) {
+                    throw new ParseException(
+                            "Field '" + posField + "' is given both by name and by position in ["
+                                    + typeName + "(...)]", t.origin());
+                }
+                IrSort declSort = decl.members().get(posField);
+                String base = baseSortName(declSort);
+                if (!"Int".equals(base) && !"Bool".equals(base) && !"Decimal".equals(base)
+                        && !"Char".equals(base)) {
+                    throw new ParseException(
+                            "A literal field pattern needs a primitive-sorted field; '"
+                                    + posField + "' of '" + typeName + "' has sort " + declSort,
+                            t.origin());
+                }
+                IrExpr lit = switch (t.kind()) {
+                    case INTEGER -> new IrExpr.Lit(Long.parseLong(t.text()), t.origin());
+                    case DECIMAL -> new IrExpr.Dec(new java.math.BigDecimal(t.text()), t.origin());
+                    case CHAR -> new IrExpr.Chr(t.text().codePointAt(0), t.origin());
+                    default -> new IrExpr.Bool(t.text().equals("true"), t.origin());
+                };
+                members.put(posField, new IrSort.Refined(base,
+                        new IrExpr.BinOp(IrExpr.Op.EQ, new IrExpr.SelfRef(t.origin()), lit, t.origin()),
+                        t.origin()));
+                literalFieldsOut.add(posField);
+                first = false;
+                continue;
+            }
+            // A nested constructor pattern as a field ([Outer(Inner(x, y), c)]) —
+            // reuse parseStructFields; the slot maps positionally and its inner
+            // fields bind via the recursive destructure desugar (renames /
+            // literal constraints recorded against the inner sort). NOT a
+            // struct-level literal/discard. Parity with tuple components.
+            if (t.kind() == CardinalToken.Kind.IDENT && peek(1).kind() == CardinalToken.Kind.LPAREN) {
+                String posField = positionalField(typeName, clauseIndex, members, t.origin());
+                CardinalToken baseTok = consume();
+                expect(CardinalToken.Kind.LPAREN);
+                java.util.Set<String> innerLiterals = new java.util.LinkedHashSet<>();
+                Map<String, String> innerRenames = new LinkedHashMap<>();
+                Map<String, IrSort> innerMembers = parseStructFields(
+                        baseTok.text(), baseTok.origin(), innerLiterals, innerRenames);
+                expect(CardinalToken.Kind.RPAREN);
+                IrSort.Structural inner = new IrSort.Structural(
+                        baseTok.text(), innerMembers, baseTok.origin());
+                if (!innerLiterals.isEmpty()) literalConstrainedFields.put(inner, innerLiterals);
+                if (!innerRenames.isEmpty()) destructureRenames.put(inner, innerRenames);
+                members.put(posField, inner);
+                first = false;
+                continue;
+            }
+            // A nested tuple pattern as a field ([Pair({a, b}, c)]) — binds its
+            // components via the recursive desugar. NOT a struct-level discard.
+            if (t.kind() == CardinalToken.Kind.LBRACE) {
+                String posField = positionalField(typeName, clauseIndex, members, t.origin());
+                members.put(posField, parseTupleSortBody(t));
+                first = false;
+                continue;
+            }
+            // A positional refinement constraint as a field ([P([Int:@>0], y)]) —
+            // constrains the slot, binds nothing (like a literal); parity with a
+            // tuple's [Int:@>0] component. (A by-name `field:[…]` narrowing is the
+            // separate COLON path below, ruled honest narrowing not a pattern.)
+            if (t.kind() == CardinalToken.Kind.LBRACKET) {
+                String posField = positionalField(typeName, clauseIndex, members, t.origin());
+                members.put(posField, parseSort());
+                literalFieldsOut.add(posField);
+                first = false;
+                continue;
+            }
+            CardinalToken fieldName = expect(CardinalToken.Kind.IDENT);
+            if (fieldName.text().equals("_")) {
+                // Verdict C: positional discard — occupies the slot (so the
+                // pattern stays arity-total) but binds nothing. Recorded in
+                // literalFieldsOut, the "constrain/occupy but don't bind" set
+                // the destructure desugar skips.
+                IrSort.Structural decl = patternShapeFor(typeName);
+                if (decl == null) {
+                    throw new ParseException(
+                            "A '_' discard inside [" + typeName + "(...)] requires '"
+                                    + typeName + "' to be declared before this point",
+                            fieldName.origin());
+                }
+                List<String> order = new ArrayList<>(decl.constructorMembers().keySet());
+                if (clauseIndex >= order.size()) {
+                    throw new ParseException(
+                            "Too many fields for struct '" + typeName + "' ("
+                                    + order.size() + " declared)", fieldName.origin());
+                }
+                String posField = order.get(clauseIndex);
+                if (members.containsKey(posField)) {
+                    throw new ParseException(
+                            "Field '" + posField + "' is given both by name and by position in ["
+                                    + typeName + "(...)]", fieldName.origin());
+                }
+                members.put(posField, decl.members().get(posField));
+                literalFieldsOut.add(posField);
+                first = false;
+                continue;
+            }
+            IrSort fieldSort;
+            if (peek().kind() == CardinalToken.Kind.COLON) {
+                consume();  // COLON
+                fieldSort = parseSort();
+                // By-name narrowing `field:Sort` must name a REAL field of the
+                // declared struct — otherwise it's silently a bogus member that
+                // binds nothing (and the body's references go unbound). A positional
+                // binder is the bare-ident form `[Type(name)]` (no `:Sort`).
+                IrSort.Structural decl = patternShapeFor(typeName);
+                if (decl != null && !decl.members().containsKey(fieldName.text())) {
+                    throw new ParseException(
+                            "Pattern [" + typeName + "(...)] narrows field '" + fieldName.text()
+                                    + "' by name, but '" + typeName + "' has no such field "
+                                    + "(declared: " + decl.members().keySet() + "). For a "
+                                    + "positional binder, drop the sort: [" + typeName + "("
+                                    + fieldName.text() + ", …)].",
+                            fieldName.origin());
+                }
+            } else {
+                // Bare ident — look up declared field sort.
+                IrSort.Structural decl = patternShapeFor(typeName);
+                if (decl == null) {
+                    throw new ParseException(
+                            "Bare field name '" + fieldName.text() + "' inside [" + typeName
+                                    + "(...)] requires '" + typeName + "' to be declared before this point "
+                                    + "(struct decl not found)",
+                            fieldName.origin());
+                }
+                IrSort declSort = decl.members().get(fieldName.text());
+                if (declSort == null) {
+                    // Not a field name → a positional RENAME binder: bind the
+                    // field at this clause position under the given name
+                    // ([Ternion(first, second, third)]).
+                    List<String> order = new ArrayList<>(decl.constructorMembers().keySet());
+                    if (clauseIndex >= order.size()) {
+                        throw new ParseException(
+                                "Too many fields for struct '" + typeName + "' ("
+                                        + order.size() + " declared)", fieldName.origin());
+                    }
+                    String posField = order.get(clauseIndex);
+                    if (members.containsKey(posField)) {
+                        throw new ParseException(
+                                "Field '" + posField + "' is given both by name and by position in ["
+                                        + typeName + "(...)]", fieldName.origin());
+                    }
+                    members.put(posField, decl.members().get(posField));
+                    renamesOut.put(posField, fieldName.text());
+                    first = false;
+                    continue;
+                }
+                fieldSort = declSort;
+            }
+            members.put(fieldName.text(), fieldSort);
+            first = false;
+        }
+        // Verdict B: a positional `(...)` pattern wears the constructor's
+        // clothes, so it must account for every field — a subset like
+        // [Ternion(a)] is lying by omission. Enforced in pattern context only;
+        // a partial field-sort *type* (e.g. [Point(x:[Int:@>0])]) is honest
+        // narrowing, not a pattern, so it's left alone.
+        // Verdict B arity-total check, in pattern context. For the deferred
+        // (cross-module) path the struct shape is unknown here, so the SAME rule
+        // runs post-link in DestructureResolver — one rule, two call sites, never
+        // implemented inconsistently per form. The local path checks it now.
+        IrSort.Structural decl = patternShapeFor(typeName);
+        if (parsingTuplePattern && decl != null) {
+            requireArityTotal(typeName, members.size(), decl.constructorMembers().size(), typeOrigin);
+        }
+        return members;
+    }
+
+    /**
+     * The arity-total rule for a positional struct pattern (verdict B): a
+     * {@code [Type(...)]} pattern wears the constructor's clothes, so it must
+     * account for EVERY field — a subset like {@code [Ternion(a)]} lies by
+     * omission. The rule itself lives ONCE in
+     * {@code DestructureResolver.arityTotalError}, shared by this parse-time
+     * local path and the post-link cross-module path, so it fires identically
+     * for both too-few and too-many.
+     */
+    private static void requireArityTotal(String typeName, int provided, int declared, Origin o)
+            throws ParseException {
+        String msg = sibarum.cardinal.ir.DestructureResolver.arityTotalError(typeName, provided, declared);
+        if (msg != null) throw new ParseException(msg, o);
+    }
+
+    /**
+     * Parses one clause of a DEFERRED (cross-module) positional struct pattern.
+     * The struct's declared fields are unknown at parse time, so the slot is
+     * keyed positionally ({@code _<clauseIndex>}) and its role is encoded in the
+     * member sort, to be resolved against the linked struct by
+     * {@code DestructureResolver}:
+     * <ul>
+     *   <li>literal ({@code 0}, {@code true}) → {@link IrSort.Refined} constraint,
+     *       slot recorded in {@code literalFieldsOut} (constrains, binds nothing);
+     *   <li>nested constructor ({@code Inner(x, y)}) → a nested deferred/known
+     *       {@link IrSort.Structural} (binds its own slots, recurses);
+     *   <li>nested tuple ({@code (a, b)}) → a tuple {@link IrSort.Structural};
+     *   <li>refinement constraint ({@code [Int:@>0]}) → the parsed sort, recorded
+     *       in {@code literalFieldsOut} (constrains, binds nothing);
+     *   <li>{@code _} discard → {@link DEFERRED_SKIP} placeholder, recorded in
+     *       {@code literalFieldsOut};
+     *   <li>bare binder ({@code x}) → {@link DEFERRED_BIND} placeholder; the
+     *       binder name is recorded as a rename off the positional key so the
+     *       body can be parsed with the binder in scope, AND it is encoded in the
+     *       placeholder sort so the resolver can recover it post-link.
+     * </ul>
+     * A by-name narrowing ({@code field:Sort}) is rejected: it requires knowing
+     * the declared fields, which a cross-module pattern doesn't have at parse
+     * time. (Cross-module by-name narrowing is the `.{}` form's job.)
+     */
+    private void parseDeferredStructFieldClause(
+            String typeName, int clauseIndex, Map<String, IrSort> members,
+            java.util.Set<String> literalFieldsOut, Map<String, String> renamesOut,
+            boolean literalClause) throws ParseException {
+        String slot = "_" + clauseIndex;
+        CardinalToken t = peek();
+        if (literalClause) {
+            consume();
+            String base = switch (t.kind()) {
+                case INTEGER -> "Int";
+                case DECIMAL -> "Decimal";
+                case CHAR -> "Char";
+                default -> "Bool";
+            };
+            IrExpr lit = switch (t.kind()) {
+                case INTEGER -> new IrExpr.Lit(Long.parseLong(t.text()), t.origin());
+                case DECIMAL -> new IrExpr.Dec(new java.math.BigDecimal(t.text()), t.origin());
+                case CHAR -> new IrExpr.Chr(t.text().codePointAt(0), t.origin());
+                default -> new IrExpr.Bool(t.text().equals("true"), t.origin());
+            };
+            members.put(slot, new IrSort.Refined(base,
+                    new IrExpr.BinOp(IrExpr.Op.EQ, new IrExpr.SelfRef(t.origin()), lit, t.origin()),
+                    t.origin()));
+            literalFieldsOut.add(slot);
+            return;
+        }
+        if (t.kind() == CardinalToken.Kind.IDENT && peek(1).kind() == CardinalToken.Kind.LPAREN) {
+            // Nested constructor pattern as a slot ([Outer(Inner(x, y), c)]).
+            CardinalToken baseTok = consume();
+            expect(CardinalToken.Kind.LPAREN);
+            java.util.Set<String> innerLiterals = new java.util.LinkedHashSet<>();
+            Map<String, String> innerRenames = new LinkedHashMap<>();
+            Map<String, IrSort> innerMembers = parseStructFields(
+                    baseTok.text(), baseTok.origin(), innerLiterals, innerRenames);
+            expect(CardinalToken.Kind.RPAREN);
+            IrSort.Structural inner = new IrSort.Structural(
+                    baseTok.text(), innerMembers, baseTok.origin());
+            if (!innerLiterals.isEmpty()) literalConstrainedFields.put(inner, innerLiterals);
+            if (!innerRenames.isEmpty()) destructureRenames.put(inner, innerRenames);
+            if (patternShapeFor(baseTok.text()) == null) deferredStructPatterns.add(inner);
+            members.put(slot, inner);
+            return;
+        }
+        if (t.kind() == CardinalToken.Kind.LBRACE) {
+            // Nested tuple pattern as a slot ([Pair({a, b}, c)]).
+            members.put(slot, parseTupleSortBody(t));
+            return;
+        }
+        if (t.kind() == CardinalToken.Kind.LBRACKET) {
+            // Positional refinement constraint as a slot ([P([Int:@>0], y)]).
+            members.put(slot, parseSort());
+            literalFieldsOut.add(slot);
+            return;
+        }
+        CardinalToken binder = expect(CardinalToken.Kind.IDENT);
+        if (peek().kind() == CardinalToken.Kind.COLON) {
+            throw new ParseException(
+                    "Pattern [" + typeName + "(...)] narrows field '" + binder.text()
+                            + "' by name, but '" + typeName + "' is imported and its fields "
+                            + "are not known at this point. Use a positional binder "
+                            + "([" + typeName + "(" + binder.text() + ", …)]) or the by-name "
+                            + "form [" + typeName + ".{" + binder.text() + "}].",
+                    binder.origin());
+        }
+        if (binder.text().equals("_")) {
+            members.put(slot, IrSort.named(DEFERRED_SKIP));
+            literalFieldsOut.add(slot);
+        } else {
+            members.put(slot, IrSort.named(DEFERRED_BIND + binder.text()));
+            renamesOut.put(slot, binder.text());
+        }
+    }
+
+    /**
+     * Implements the implicit {@code @==EXPR} sugar — see principle 5 in
+     * docs/language-reference.ptf. Applied per-disjunct/conjunct so
+     * {@code [Int:0|1]} reads as {@code @==0 | @==1}, not {@code @==(0|1)}.
+     */
+    private static IrExpr applyPredicateSugar(IrExpr pred) {
+        if (pred instanceof IrExpr.BinOp bop) {
+            IrExpr.Op op = bop.op();
+            if (op == IrExpr.Op.OR || op == IrExpr.Op.AND) {
+                return new IrExpr.BinOp(op,
+                        applyPredicateSugar(bop.left()),
+                        applyPredicateSugar(bop.right()),
+                        bop.origin());
+            }
+            // Chained comparison: `A op1 B op2 C` parses left-associatively as
+            // `op2(op1(A, B), C)`, which without this rewrite would evaluate the
+            // inner comparison to a Bool and then compare THAT to C — silently
+            // wrong (`0 <= @ < 10` read as `(0<=@) < 10`). Desugar a chain of
+            // ORDER comparisons into the conjunction `(A op1 B) & (B op2 C)`, the
+            // standard reading. The shared middle term B is the inner's right
+            // operand. Recurse so 3+-way chains (`a < b < c < d`) flatten fully.
+            if (isOrderComparison(op)
+                    && bop.left() instanceof IrExpr.BinOp inner
+                    && isOrderComparison(inner.op())) {
+                IrExpr middle = inner.right();
+                IrExpr second = new IrExpr.BinOp(op, middle, bop.right(), bop.origin());
+                return new IrExpr.BinOp(IrExpr.Op.AND,
+                        applyPredicateSugar(inner),
+                        applyPredicateSugar(second),
+                        bop.origin());
+            }
+            if (isComparison(op)) {
+                return pred;
+            }
+        }
+        // Wrap: @ == pred
+        return new IrExpr.BinOp(IrExpr.Op.EQ,
+                new IrExpr.SelfRef(pred.origin()),
+                pred,
+                pred.origin());
+    }
+
+    // --- Expressions (Pratt) ---
+
+    public IrExpr parseExpr() throws ParseException {
+        return parseExpr(0);
+    }
+
+    private IrExpr parseExpr(int minPrec) throws ParseException {
+        IrExpr left = parsePrimaryWithPostfix();
+        while (true) {
+            CardinalToken t = peek();
+            if (t.kind() != CardinalToken.Kind.OP) break;
+            // A line-leading `&` is the spread prefix (`&s:[…]` as its own
+            // statement), not infix conjunction — disambiguate by position, the
+            // same same-line rule the postfix chain uses. Without this, a prior
+            // statement's value (`let s = (1,2,3,4)`) greedily absorbs the next
+            // line's `&s` as `(…) & s`.
+            if ("&".equals(t.text()) && !postfixOpensOnSameLine(t)) break;
+            int prec = precedence(t.text());
+            if (prec < minPrec) break;
+            consume();
+            IrExpr right = parseExpr(prec + 1);  // left-associative
+            // Operators are symmetric mechanism-1 multi-dispatch: `a <op> b`
+            // always parses to a BinOp. The post-link MethodOperatorResolver
+            // routes user-declared operators to their overload by matching BOTH
+            // operand base sorts, and leaves built-in Int/Bool ops as BinOp.
+            // No parse-time guess from the left operand's sort (which could not
+            // see cross-module types and forced the receiver-rooted asymmetry).
+            left = new IrExpr.BinOp(opKind(t.text()), left, right, t.origin());
+        }
+        return left;
+    }
+
+    /**
+     * Operators that can be overloaded — via a bare generic
+     * {@code function <op>(l, r)}. Arithmetic and comparison. Logical {@code &}
+     * and {@code |} are excluded — they always go through BinOp regardless of
+     * any declaration named {@code &}. The receiver-rooted {@code method Type.op}
+     * form is rejected at parse (see {@link #parseMethod}); operators are free
+     * functions.
+     */
+    private static final Set<String> OVERLOADABLE_OPS = Set.of(
+            "+", "-", "*", "/", "%", "^",
+            "<", "<=", ">", ">=", "==", "!=");
+
+    /**
+     * A postfix {@code (} or <code>{</code> must open on the same line as the
+     * token it extends — a newline ends the call/struct-literal postfix chain.
+     * Without this, a declaration body silently swallowed the next construct:
+     * {@code -> Ratio(a, b)} followed by a {@code (expr).x} main parsed as a
+     * CALL of the body, the module lost its main, and the placeholder main 0
+     * "ran". Dot-chains may still continue across lines (fluent style).
+     */
+    private boolean postfixOpensOnSameLine(CardinalToken t) {
+        return pos > 0 && tokens.get(pos - 1).line() == t.line();
+    }
+
+    /**
+     * Anonymous by-name aggregate (dictionary) literal: {@code {a = 1, b = 2}}
+     * — the by-name sibling of the tuple literal. Lowers to an anonymous
+     * {@link IrExpr.Record} (null typeName), the same shape the S-expr
+     * {@code (record …)} form produces; rides the record substrate with no new
+     * node. Free-form: no completeness obligation (there is no named type to be
+     * complete <em>of</em>). Duplicate keys are rejected.
+     */
+    private IrExpr parseDictLiteral() throws ParseException {
+        CardinalToken open = expect(CardinalToken.Kind.LBRACE);
+        Map<String, IrExpr> members = new LinkedHashMap<>();
+        boolean first = true;
+        while (peek().kind() != CardinalToken.Kind.RBRACE) {
+            if (!first) expect(CardinalToken.Kind.COMMA);
+            CardinalToken key = expect(CardinalToken.Kind.IDENT);
+            if (members.containsKey(key.text())) {
+                throw new ParseException(
+                        "Duplicate key '" + key.text() + "' in dictionary literal",
+                        key.origin());
+            }
+            expect(CardinalToken.Kind.EQUALS);
+            members.put(key.text(), parseExpr());
+            first = false;
+        }
+        CardinalToken close = expect(CardinalToken.Kind.RBRACE);
+        return new IrExpr.Record(null, members, open.spanTo(close));
+    }
+
+    /** True for a tuple positional key — {@code _0}, {@code _1}, … (underscore + digits). */
+    private IrExpr parsePrimaryWithPostfix() throws ParseException {
+        // Spread-ascription `&s:[transform]` — the inline/anonymous face of applying
+        // a transform per element over a stream (docs/stream-war.md §3). `&a:[x]` ≡
+        // `x(&a)`; this is the lambda-to-its-named-function counterpart. A leading
+        // `&` is unambiguous (binary `&` is handled by the infix loop in parseExpr).
+        if ((peek().kind() == CardinalToken.Kind.OP && "&".equals(peek().text()))
+                || (peek().kind() == CardinalToken.Kind.LPAREN
+                        && peek(1).kind() == CardinalToken.Kind.OP && "&".equals(peek(1).text()))) {
+            return parseSpreadAscription();
+        }
+        IrExpr expr = parsePrimary();
+        // Postfix: .IDENT (field access), (args) (positional call or struct
+        // literal), {x=val,...} (by-name struct literal) — left-to-right.
+        while (true) {
+            CardinalToken t = peek();
+            if (t.kind() == CardinalToken.Kind.LBRACKET
+                    && expr instanceof IrExpr.Var fnVar
+                    && postfixOpensOnSameLine(t)
+                    && !types.isStruct(fnVar.name())
+                    && typeApplicationAhead()) {
+                // Explicit type-application of a generic function: `map[Int, String](args)`
+                // (docs/stream-war.md §8b). The `[…]` are TYPE arguments (bracket/paren
+                // law: `[]` for types); a metareference would be `$`-prefixed. Parse them,
+                // mangle a concrete specialization name, record the instantiation (the
+                // specialization decl is generated at module assembly — param/return sorts
+                // substituted, body + type-params kept so residual `A` stays in scope), and
+                // emit a call to the mangled name, which dispatches CONCRETELY (no
+                // inference). Requires a following `(args)` — a bare `name[T]` value form
+                // is a later slice.
+                consume();  // [
+                List<IrSort> typeArgs = new ArrayList<>();
+                boolean firstArg = true;
+                while (peek().kind() != CardinalToken.Kind.RBRACKET) {
+                    if (!firstArg) expect(CardinalToken.Kind.COMMA);
+                    typeArgs.add(parseSort());
+                    firstArg = false;
+                }
+                expect(CardinalToken.Kind.RBRACKET);
+                String mangled = mangleInstantiation(fnVar.name(), typeArgs);
+                pendingTypeInstantiations.putIfAbsent(
+                        mangled, new PendingInstantiation(fnVar.name(), typeArgs));
+                CardinalToken open = expect(CardinalToken.Kind.LPAREN);
+                List<IrExpr> args = parseArgList();
+                CardinalToken close = expect(CardinalToken.Kind.RPAREN);
+                Origin callOrigin = open.spanTo(close);
+                expr = lowerSpreadCall(args, a -> new IrExpr.Call(mangled, a, callOrigin), callOrigin);
+                continue;
+            }
+            if (t.kind() == CardinalToken.Kind.DOT && peek(1).kind() == CardinalToken.Kind.IDENT) {
+                consume();  // DOT
+                CardinalToken name = consume();
+                // Positional projection `value._N` reads a tuple component, the
+                // read-access sibling of destructuring (`let [(a, b)] = …`) — every
+                // other aggregate has both a read and a destructure form, and tuples
+                // are no exception (RULED 2026-06-21, James). `@._N` in a refinement
+                // predicate (base is the SelfRef `@`) is the same projection.
+                expr = new IrExpr.FieldAccess(expr, name.text(), t.origin());
+            } else if (t.kind() == CardinalToken.Kind.LPAREN && postfixOpensOnSameLine(t)) {
+                CardinalToken open = consume();
+                // Struct-literal shortcut: a bare ident matching a declared
+                // struct constructs a record (positional), not a Call. Native
+                // constructors (Decimal(unscaled, scale)) route the same way —
+                // their registered shape plays the struct declaration's part.
+                if (expr instanceof IrExpr.Var v && types.isStruct(v.name())) {
+                    expr = parsePositionalStructLiteral(
+                            declaredStructShape(v.name()), v.name(), open);
+                    continue;
+                }
+                if (expr instanceof IrExpr.Var v
+                        && sibarum.cardinal.ir.NativeConstructors.has(v.name())) {
+                    expr = parsePositionalStructLiteral(
+                            sibarum.cardinal.ir.NativeConstructors.get(v.name()).shape(),
+                            v.name(), open);
+                    continue;
+                }
+                List<IrExpr> args = parseArgList();
+                CardinalToken close = expect(CardinalToken.Kind.RPAREN);
+                Origin callOrigin = open.spanTo(close);
+
+                // Instance-method call: `receiver.method(args)` on a VALUE
+                // receiver becomes an unresolved MethodCall. MethodResolver (an
+                // IR pass) keys it to `Type.method` by the receiver's inferred
+                // type — after every declaration is registered, so resolution is
+                // order-independent (forward references, self- and mutual
+                // recursion all work). The receiver gets the top-level-let
+                // rewrite first (a let-bound value is invoked as a 0-arg call
+                // before becoming the receiver). A module- or type-qualified
+                // dotted name (`std.stream.concat`, `Point.zero`) is NOT a value
+                // receiver and stays a dotted Call (resolved by NameResolver).
+                if (expr instanceof IrExpr.FieldAccess fa) {
+                    IrExpr receiver = rewriteTopLevelLetAccess(fa.base());
+                    if (isValueReceiver(receiver)) {
+                        String method = fa.fieldName();
+                        expr = lowerSpreadCall(args,
+                                a -> new IrExpr.MethodCall(receiver, method, a, callOrigin),
+                                callOrigin);
+                        continue;
+                    }
+                }
+
+                // Otherwise it's a Call on a dotted name, or an Apply on an
+                // arbitrary expression. A `&`-spread argument turns either into a
+                // per-element stream map (docs/stream-war.md §3).
+                String dotted = extractDottedName(expr);
+                if (dotted != null) {
+                    // Generic type-param INFERENCE (docs/stream-war.md §8b): a bare call to
+                    // a generic function infers its type args by unifying each param sort
+                    // against the argument's inferred sort, then reuses the explicit-
+                    // instantiation path. Falls back to the plain call when inference can't
+                    // solve every param (then explicit `f[T](…)` is required).
+                    String inferred = inferGenericInstantiation(dotted, args);
+                    String target = inferred != null ? inferred : dotted;
+                    expr = lowerSpreadCall(args, a -> new IrExpr.Call(target, a, callOrigin),
+                            callOrigin);
+                } else {
+                    IrExpr fn = expr;
+                    expr = lowerSpreadCall(args, a -> new IrExpr.Apply(fn, a, callOrigin),
+                            callOrigin);
+                }
+            } else if (t.kind() == CardinalToken.Kind.LBRACE
+                    && postfixOpensOnSameLine(t)
+                    && expr instanceof IrExpr.Var v
+                    && types.shapeOf(v.name()).isPresent()) {
+                // By-name struct literal `Foo{x=a, y=b}`. The brace form is
+                // reserved for declared-struct construction in this slice;
+                // anonymous and dotted-name forms are deferred. Native
+                // constructors (their shape answered by the catalog too) take it as well.
+                CardinalToken open = consume();
+                IrSort.Structural shape = types.shapeOf(v.name()).orElseThrow();
+                expr = parseByNameStructLiteral(shape, v.name(), open);
+            } else if (t.kind() == CardinalToken.Kind.LBRACE
+                    && postfixOpensOnSameLine(t)
+                    && expr instanceof IrExpr.Var v
+                    && isCapitalizedName(v.name())
+                    && byNameAggregateAhead()) {
+                // Deferred by-name struct literal for an IMPORTED struct. The
+                // parser can't see the declaration (not in declaredStructs), so —
+                // mirroring the positional Call deferral — emit an uncanonicalized
+                // Record(typeName, source-order members). The linker's
+                // StructLiteralRewriter validates the field set and reorders to
+                // declared order once every struct is FQN'd and visible.
+                CardinalToken open = consume();
+                expr = parseDeferredByNameStructLiteral(v.name(), open);
+            } else {
+                break;
+            }
+        }
+        return rewriteTopLevelLetAccess(expr);
+    }
+
+    /**
+     * If {@code receiver}'s inferred sort has a base name {@code Type} and a
+     * function/method {@code Type.field} is declared, returns the
+     * fully-qualified method name. Used by the instance-method call routing
+     * in {@link #parsePrimaryWithPostfix}.
+     */
+    /**
+     * Whether {@code receiver} (already run through
+     * {@link #rewriteTopLevelLetAccess}) is a <em>value</em> expression — the
+     * left of an instance-method call — versus a module/type-qualified name.
+     * Anything that isn't a bare/dotted name is a value (a struct literal, a
+     * call result, a method-call result, a 0-arg let/function call). A
+     * dotted-name receiver is a value only when its head is a bound local or a
+     * top-level let; otherwise it names a module or a type ({@code std.stream},
+     * {@code Point}) and the call stays a dotted {@link IrExpr.Call}. This
+     * decision is independent of method declaration order.
+     */
+    private boolean isValueReceiver(IrExpr receiver) {
+        String dotted = extractDottedName(receiver);
+        if (dotted == null) {
+            return true;
+        }
+        int dot = dotted.indexOf('.');
+        String head = dot < 0 ? dotted : dotted.substring(0, dot);
+        return currentScope.containsKey(head) || declaredTopLevelLets.containsKey(head);
+    }
+
+    /**
+     * Rewrites top-level let and 0-arg-function accesses to 0-arg dispatch
+     * calls so the dispatch table resolves them. Lets and 0-arg functions
+     * are treated equivalently — both are 0-arg dispatch entries from the
+     * call-site's perspective, both auto-Call on bare reference. Handles
+     * two shapes:
+     * <ul>
+     *   <li>Bare {@code Var(name)} — if {@code name} is a declared let or a
+     *       declared 0-arg function and not shadowed by {@link #currentScope},
+     *       becomes {@code Call(name, [])}.
+     *   <li>{@code FieldAccess} chain rooted at a Var — the longest dotted
+     *       prefix matching a let or 0-arg function becomes a 0-arg Call,
+     *       with the remaining suffix kept as a chain of FieldAccesses.
+     * </ul>
+     * Functions with at least one declared param are never auto-Called
+     * (they require explicit args).
+     */
+    private IrExpr rewriteTopLevelLetAccess(IrExpr expr) {
+        if (expr instanceof IrExpr.Var v) {
+            if (!currentScope.containsKey(v.name())
+                    && isZeroArgDispatchEntry(v.name())) {
+                return new IrExpr.Call(v.name(), List.of(), v.origin());
+            }
+            return expr;
+        }
+        if (expr instanceof IrExpr.FieldAccess) {
+            return rewriteDottedLetAccess(expr);
+        }
+        return expr;
+    }
+
+    /**
+     * True if {@code name} is a 0-arg dispatch entry — either a declared
+     * top-level let, or a function declared with no params. Both auto-Call
+     * on bare reference.
+     */
+    private boolean isZeroArgDispatchEntry(String name) {
+        return declaredTopLevelLets.containsKey(name)
+                || declaredZeroArgFunctions.contains(name);
+    }
+
+    /**
+     * Walks a FieldAccess chain to its leftmost Var, looks for the longest
+     * dotted prefix that matches a 0-arg dispatch entry (let or 0-arg
+     * function), and rewrites that prefix to a 0-arg Call (keeping any
+     * trailing field accesses as a chain on top). Returns the expression
+     * unchanged if no such prefix matches or if the chain's root is shadowed
+     * by {@link #currentScope}.
+     */
+    private IrExpr rewriteDottedLetAccess(IrExpr expr) {
+        List<String> segments = new ArrayList<>();
+        IrExpr cur = expr;
+        while (cur instanceof IrExpr.FieldAccess fa) {
+            segments.add(0, fa.fieldName());
+            cur = fa.base();
+        }
+        if (!(cur instanceof IrExpr.Var rootVar)) return expr;
+        if (currentScope.containsKey(rootVar.name())) return expr;
+        segments.add(0, rootVar.name());
+
+        int matchedLength = -1;
+        for (int i = segments.size(); i >= 1; i--) {
+            String prefix = String.join(".", segments.subList(0, i));
+            if (isZeroArgDispatchEntry(prefix)) {
+                matchedLength = i;
+                break;
+            }
+        }
+        if (matchedLength == -1) return expr;
+
+        String prefix = String.join(".", segments.subList(0, matchedLength));
+        IrExpr result = new IrExpr.Call(prefix, List.of(), rootVar.origin());
+        for (int i = matchedLength; i < segments.size(); i++) {
+            result = new IrExpr.FieldAccess(result, segments.get(i), expr.origin());
+        }
+        return result;
+    }
+
+    /**
+     * Parses {@code (a, b, ...)} after a struct-name root — positional struct
+     * literal. The opening paren is already consumed.
+     *
+     * <p>Validates arity equals the struct's field count and maps positional
+     * args to declared field names in declaration order. The resulting
+     * {@link IrExpr.Record} iterates fields in declared order regardless of
+     * how the call was written.
+     */
+    private IrExpr.Record parsePositionalStructLiteral(
+            IrSort.Structural decl, String typeName, CardinalToken openParen)
+            throws ParseException {
+        List<IrExpr> args = parseArgList();
+        CardinalToken close = expect(CardinalToken.Kind.RPAREN);
+        if (anySpread(args)) {
+            throw new ParseException(
+                    "`&` spread is only valid in a function/fragment call, not the struct "
+                            + "literal '" + typeName + "'", openParen.origin());
+        }
+        List<String> declaredFields = new ArrayList<>(decl.constructorMembers().keySet());
+        if (args.size() != declaredFields.size()) {
+            throw new ParseException(
+                    "Struct literal for '" + typeName + "' expects "
+                            + declaredFields.size() + " positional arg(s) but got "
+                            + args.size() + "; declared fields: " + declaredFields,
+                    openParen.origin());
+        }
+        Map<String, IrExpr> ordered = new LinkedHashMap<>();
+        for (int i = 0; i < args.size(); i++) {
+            ordered.put(declaredFields.get(i), args.get(i));
+        }
+        return new IrExpr.Record(typeName, ordered, openParen.spanTo(close));
+    }
+
+    /**
+     * Parses {@code {x=a, y=b, ...}} after a struct-name root — by-name struct
+     * literal. The opening brace is already consumed.
+     *
+     * <p>Validates: every field name belongs to the struct, every declared
+     * field is present exactly once (no missing, no duplicates). Reorders
+     * the resulting {@link IrExpr.Record} into declared field iteration order
+     * so the IR is canonical regardless of source order.
+     */
+    private IrExpr.Record parseByNameStructLiteral(
+            IrSort.Structural decl, String typeName, CardinalToken openBrace)
+            throws ParseException {
+        Map<String, IrExpr> provided = new LinkedHashMap<>();
+        boolean first = true;
+        while (peek().kind() != CardinalToken.Kind.RBRACE) {
+            if (!first) expect(CardinalToken.Kind.COMMA);
+            CardinalToken fieldTok = expect(CardinalToken.Kind.IDENT);
+            String fieldName = fieldTok.text();
+            if (decl.extensions().containsKey(fieldName)) {
+                throw new ParseException(
+                        "Field '" + fieldName + "' of '" + typeName + "' is a constructor-"
+                                + "extension field — it is computed at construction and can "
+                                + "never be supplied (or reassigned) by a literal",
+                        fieldTok.origin());
+            }
+            if (!decl.members().containsKey(fieldName)) {
+                throw new ParseException(
+                        "Struct '" + typeName + "' has no field '" + fieldName
+                                + "'; declared fields: " + decl.constructorMembers().keySet(),
+                        fieldTok.origin());
+            }
+            if (provided.containsKey(fieldName)) {
+                throw new ParseException(
+                        "Field '" + fieldName + "' appears more than once in struct "
+                                + "literal for '" + typeName + "'",
+                        fieldTok.origin());
+            }
+            expect(CardinalToken.Kind.EQUALS);
+            IrExpr value = parseExpr();
+            provided.put(fieldName, value);
+            first = false;
+        }
+        CardinalToken close = expect(CardinalToken.Kind.RBRACE);
+        for (String declaredField : decl.constructorMembers().keySet()) {
+            if (!provided.containsKey(declaredField)) {
+                throw new ParseException(
+                        "Struct literal for '" + typeName + "' is missing field '"
+                                + declaredField + "'; required fields: "
+                                + decl.constructorMembers().keySet(),
+                        openBrace.origin());
+            }
+        }
+        Map<String, IrExpr> ordered = new LinkedHashMap<>();
+        for (String declaredField : decl.constructorMembers().keySet()) {
+            ordered.put(declaredField, provided.get(declaredField));
+        }
+        return new IrExpr.Record(typeName, ordered, openBrace.spanTo(close));
+    }
+
+    /**
+     * Parses {@code {x=a, y=b, …}} after a capitalized name that is NOT a locally
+     * declared struct — an IMPORTED struct, invisible at parse time. Produces an
+     * <em>uncanonicalized</em> {@link IrExpr.Record} carrying the source field
+     * order; the field-set check and reorder to declared order happen post-link in
+     * {@link sibarum.cardinal.ir.StructLiteralRewriter} (the by-name twin of the
+     * positional Call deferral). The opening brace is already consumed. Only
+     * duplicate keys — a purely syntactic error knowable without the declaration —
+     * are rejected here.
+     */
+    private IrExpr.Record parseDeferredByNameStructLiteral(String typeName, CardinalToken openBrace)
+            throws ParseException {
+        Map<String, IrExpr> provided = new LinkedHashMap<>();
+        boolean first = true;
+        while (peek().kind() != CardinalToken.Kind.RBRACE) {
+            if (!first) expect(CardinalToken.Kind.COMMA);
+            CardinalToken fieldTok = expect(CardinalToken.Kind.IDENT);
+            String fieldName = fieldTok.text();
+            if (provided.containsKey(fieldName)) {
+                throw new ParseException(
+                        "Field '" + fieldName + "' appears more than once in struct "
+                                + "literal for '" + typeName + "'",
+                        fieldTok.origin());
+            }
+            expect(CardinalToken.Kind.EQUALS);
+            provided.put(fieldName, parseExpr());
+            first = false;
+        }
+        CardinalToken close = expect(CardinalToken.Kind.RBRACE);
+        return new IrExpr.Record(typeName, provided, openBrace.spanTo(close));
+    }
+
+    /**
+     * In-expression let: {@code let NAME (:Sort)? = VALUE BODY}.
+     *
+     * <p>Surface form mirrors top-level {@link #parseLet} for the common case
+     * but lives inside an expression scope. No explicit separator between
+     * VALUE and BODY — the value is parsed greedily via {@link #parseExpr},
+     * stopping naturally at non-operator tokens; BODY is the next expression.
+     * Single-ident names only (dotted lets remain top-level).
+     *
+     * <p>Lowering: {@link IrExpr.LetIn}. The bound name is pushed into
+     * {@link #currentScope} for body parsing only; on exit, the previous
+     * binding (if any — e.g., a shadowed function param) is restored.
+     */
+    /**
+     * Expression-level destructuring let: {@code let [Pattern] = VALUE BODY} is
+     * sugar for {@code match VALUE { [Pattern] -> BODY }}. The match-totality
+     * checker enforces the let rule for free: the pattern must be proven total
+     * over the value's sort — trivially (a bare destructure) or via the kernel
+     * (a provable narrowing) — otherwise it's a refutable pattern and the
+     * compile fails, directing the user to a real match.
+     */
+    private IrExpr parseDestructuringLetExpr(CardinalToken start) throws ParseException {
+        IrSort pattern = parsePattern();
+        expect(CardinalToken.Kind.EQUALS);
+        IrExpr value = parseExpr();
+        checkTupleArity(value, pattern);
+        IrExpr body = parseExpr();
+        return desugarStructuralDestructure(
+                value,
+                List.of(new IrExpr.MatchBranch(pattern, body)),
+                start.origin());
+    }
+
+    /**
+     * Top-level destructuring let: {@code let [Ternion(a, b, c)] = VALUE}
+     * lowers to a synthetic 0-arg value binding plus one 0-arg accessor per
+     * bound field, each accessor being the single-arm match
+     * {@code match __d { [Pattern] -> field }} — the proof obligation and the
+     * binding semantics are identical to the expression level; only the
+     * lowering target differs (declarations instead of a scoped expression,
+     * exactly like plain lets).
+     */
+    private IrStmt parseDestructuringLetTop(CardinalToken start) throws ParseException {
+        IrSort pattern = parsePattern();
+        if (!(pattern instanceof IrSort.Structural sp)) {
+            throw new ParseException(
+                    "A top-level destructuring let needs a struct pattern — "
+                            + "e.g. let [Ternion(a, b, c)] = …",
+                    start.origin());
+        }
+        expect(CardinalToken.Kind.EQUALS);
+        IrExpr value = parseExpr();
+        checkTupleArity(value, sp);
+        String synthetic = "__destructure$" + (syntheticCounter++);
+        IrSort valueSort = inference.maximalSort(value);
+        declaredTopLevelLets.put(synthetic, valueSort);
+        // Collect every leaf binder (recursively through nested patterns), then
+        // emit one accessor per binder. The accessor's body re-runs the full
+        // pattern match and returns that binder — and desugarStructuralDestructure
+        // (via wrapDestructureBindings) binds nested binders too, so a leaf like
+        // `x` in `[Outer(Inner(x, y), c)]` reads as `synthetic._<inner>._<x>`.
+        List<Map.Entry<String, IrSort>> binders = new ArrayList<>();
+        collectPatternBinders(sp, binders);
+        for (Map.Entry<String, IrSort> b : binders) {
+            String binder = b.getKey();
+            IrExpr accessor = desugarStructuralDestructure(
+                    new IrExpr.Call(synthetic, List.of(), start.origin()),
+                    List.of(new IrExpr.MatchBranch(sp, new IrExpr.Var(binder, start.origin()))),
+                    start.origin());
+            declaredTopLevelLets.put(binder, b.getValue());
+            pendingTopLevelDecls.add(new IrStmt.FunctionDecl(
+                    binder, List.of(), b.getValue(), accessor, start.origin(), true));
+        }
+        return new IrStmt.FunctionDecl(synthetic, List.of(), valueSort, value, start.origin(), true);
+    }
+
+    /**
+     * Collects every leaf binder a structural pattern introduces, recursing
+     * through nested struct/tuple patterns — the binder name (after renames) and
+     * its sort. Mirrors {@link #wrapDestructureBindings}' walk: a nested
+     * Structural member recurses; a literal-/{@code _}-constrained field binds
+     * nothing; everything else is a leaf binder.
+     */
+    /**
+     * Seeds a structural pattern's leaf binders into {@link #currentScope} for
+     * the duration of an arm-body parse — so they're recognized as value
+     * receivers (the only effect that matters at parse time). The binder's sort
+     * is best-effort ({@code "_"} when the pattern leaves it as the placeholder);
+     * the real field sort flows post-parse through the destructure desugar's
+     * {@code let binder = scrutinee.field} and {@code MethodResolver}. A non-
+     * structural pattern (a refinement, {@code [_]}) binds nothing.
+     */
+    /**
+     * The leaf binders a match pattern introduces — the destructure (left) side of a
+     * match-arm clause, fed to {@link #parseClauseBody} as an OPEN clause (the arm body
+     * also sees the enclosing scope). docs/arrows.md.
+     */
+    private List<IrParam> patternBinders(IrSort pattern) {
+        if (!(pattern instanceof IrSort.Structural sp)) {
+            return List.of();
+        }
+        List<Map.Entry<String, IrSort>> binders = new ArrayList<>();
+        collectPatternBinders(sp, binders);
+        List<IrParam> out = new ArrayList<>(binders.size());
+        for (Map.Entry<String, IrSort> b : binders) {
+            out.add(new IrParam(b.getKey(), b.getValue() == null ? IrSort.named("_") : b.getValue()));
+        }
+        return out;
+    }
+
+    private void collectPatternBinders(
+            IrSort.Structural sp, List<Map.Entry<String, IrSort>> out) {
+        java.util.Set<String> constrainedOnly =
+                literalConstrainedFields.getOrDefault(sp, java.util.Set.of());
+        Map<String, String> renames = destructureRenames.getOrDefault(sp, Map.of());
+        for (Map.Entry<String, IrSort> e : sp.members().entrySet()) {
+            if (e.getValue() instanceof IrSort.Structural nested) {
+                collectPatternBinders(nested, out);
+            } else if (constrainedOnly.contains(e.getKey())) {
+                // constrains the match, binds nothing
+            } else {
+                // A deferred slot's sort is the placeholder encoding (_$bind$x) —
+                // the binder's real sort isn't known until link time, so seed it
+                // as the unknown sort `_` for body parsing.
+                IrSort sort = isDeferredEncodedSort(e.getValue()) ? IrSort.named("_") : e.getValue();
+                out.add(Map.entry(renames.getOrDefault(e.getKey(), e.getKey()), sort));
+            }
+        }
+    }
+
+    /** Monotonic counter making each discard-`let`'s synthetic binding name unique. */
+    private int discardSeq = 0;
+
+    /**
+     * The discard form {@code let EXPR  CONT} (docs/orchestration.md, the `let`-led preamble):
+     * {@code let} with no {@code = } evaluates EXPR for effect and drops its value, then the
+     * continuation is the block's value — statement-shaped exactly like {@code emit}. It subsumes
+     * the retired {@code call} keyword ("let it happen"). A binding head is an {@code IDENT}
+     * immediately followed by {@code =}, {@code :}, or the {@code .{} } dict-decomposition; anything
+     * else after {@code let} is a discard. (The explicit throwaway {@code let _ = EXPR} is just a
+     * binding whose name is {@code _} — it flows through the named path, no special-casing.)
+     *
+     * <p>Whether the discarded EXPR is actually effectful is not a parse-time question — the effect
+     * gate (a post-link {@code EmitInterface} closure) rejects a discard of a provably effect-free
+     * expression later, pointing the author at {@code let x = …} or {@code let _ = …}.
+     */
+    private boolean isLetBindingHead() {
+        if (peek().kind() != CardinalToken.Kind.IDENT) return false;
+        CardinalToken.Kind next = peek(1).kind();
+        return next == CardinalToken.Kind.EQUALS
+                || next == CardinalToken.Kind.COLON
+                || (next == CardinalToken.Kind.DOT && peek(2).kind() == CardinalToken.Kind.LBRACE);
+    }
+
+    private IrExpr parseLetExpr() throws ParseException {
+        CardinalToken start = expectKeyword("let");
+        if (peek().kind() == CardinalToken.Kind.LBRACKET) {
+            return parseDestructuringLetExpr(start);
+        }
+        if (!isLetBindingHead()) {
+            // Discard form `let EXPR  CONT` — evaluate for effect, drop the value.
+            IrExpr discarded = parseExpr();
+            IrExpr cont = parseExpr();
+            return new IrExpr.LetIn("#discard#" + (discardSeq++), IrSort.named("_"),
+                    discarded, cont, start.origin());
+        }
+        CardinalToken nameTok = expect(CardinalToken.Kind.IDENT);
+        String name = nameTok.text();
+        if (KEYWORDS.contains(name)) {
+            throw new ParseException(
+                    "Cannot bind keyword '" + name + "' as a let-name",
+                    nameTok.origin());
+        }
+        if (peek().kind() == CardinalToken.Kind.DOT && peek(1).kind() == CardinalToken.Kind.LBRACE) {
+            return parseDictDecompositionLetExpr(start, nameTok);
+        }
+        IrSort declaredSort = null;
+        IrExpr value = null;
+        if (peek().kind() == CardinalToken.Kind.COLON) {
+            consume();
+            // A clause after `:` in a nested let — the same unified ascription rule as
+            // top level (docs/arrows.md): with a `= rhs` SUBJECT the clause is APPLIED
+            // to it (`let x:[Int -> @+"" -> String] = 12` ⟹ "12"); with NO subject it
+            // binds the clause as a first-class fragment value and the rest of the
+            // block is the let-in body.
+            if (looksLikeClause()) {
+                IrExpr.Lambda frag = parseClause();
+                if (peek().kind() == CardinalToken.Kind.EQUALS) {
+                    consume();
+                    value = applyReturnClause(parseExpr(), frag);
+                    declaredSort = frag.returnSort();
+                } else {
+                    List<IrSort> paramSorts = new ArrayList<>();
+                    List<String> paramNames = new ArrayList<>();
+                    for (IrParam p : frag.params()) {
+                        paramSorts.add(p.sort());
+                        paramNames.add(p.name());
+                    }
+                    IrSort methodSort = new IrSort.CallSig(
+                            IrSort.CallSig.METHOD, paramSorts, paramNames,
+                            frag.returnSort(), start.origin());
+                    IrSort prev = currentScope.get(name);
+                    boolean had = currentScope.containsKey(name);
+                    currentScope.put(name, methodSort);
+                    IrExpr fragBody;
+                    try {
+                        fragBody = parseExpr();
+                    } finally {
+                        if (had) currentScope.put(name, prev); else currentScope.remove(name);
+                    }
+                    return new IrExpr.LetIn(name, methodSort, frag, fragBody, start.origin());
+                }
+            } else {
+                declaredSort = parseSort();
+            }
+        }
+        if (value == null) {
+            expect(CardinalToken.Kind.EQUALS);
+            value = parseExpr();
+        }
+        IrSort inferred = inference.maximalSort(value);
+        // Same binding-sort decision as top-level parseLet — a `let` coerces identically wherever it
+        // sits, differing only in scope (James 2026-07-07). The nominal engine ({@link Assignability},
+        // via nominalBinding) decides the trait-free cases and throws on a provable mismatch (roadmap
+        // §4.5 item 1 — replacing CoercionResolver). A null result defers to the tuple-autobox sentinel
+        // / declared-claim below (trait cases judged post-link by the construction/claim gate).
+        boolean streamAutobox = false;
+        IrSort binding = inference.nominalBinding(inferred, declaredSort, name, start.origin());
+        if (binding == null) {
+            String inferredBase = baseSortName(inferred);
+            String declaredBase = baseSortName(declaredSort);
+            if ("_tuple".equals(inferredBase) && "Stream".equals(declaredBase)) {
+                String elemError = streamElementError(declaredSort, inferred);
+                if (elemError != null) throw new ParseException(elemError, start.origin());
+                streamAutobox = true;
+            }
+            // Every deferred case (autobox, record-promotion, trait, undecidable) binds at the
+            // declared sort — the claim rides the LetIn below, judged post-link.
+            binding = declaredSort;
+        }
+        IrSort prevBinding = currentScope.get(name);
+        boolean hadPrev = currentScope.containsKey(name);
+        currentScope.put(name, binding);
+        IrExpr body;
+        try {
+            body = parseExpr();
+        } finally {
+            if (hadPrev) currentScope.put(name, prevBinding);
+            else currentScope.remove(name);
+        }
+        // The declared sort travels as the binding's claim — judged by the
+        // construction gate three-way, like a constructor argument. The stream
+        // autobox is gated at parse time (§8.6), so it carries no runtime claim.
+        return new IrExpr.LetIn(name, binding, value, body, start.origin(),
+                streamAutobox ? null : declaredSort);
+    }
+
+    /**
+     * Match expression: {@code match SCRUTINEE [{] [pred] -> result ... [}]}.
+     * Braces are optional — without them, arms continue until the next token
+     * is not {@code [}.
+     *
+     * <p>Inside an arm, {@code @} is the scrutinee value-under-refinement (no
+     * variable substitution magic — see {@code substituteVarWithSelf} in the
+     * old parser, which is gone). When the scrutinee is a {@link IrExpr.Var}
+     * naming an in-scope param/let, the arm's contextual {@code [pred]} form
+     * inherits the param's base sort for the pattern's {@link IrSort.Refined}.
+     */
+    private IrExpr parseMatch() throws ParseException {
+        CardinalToken start = expectKeyword("match");
+        IrExpr scrutinee = parseExpr();
+
+        // Determine contextual base from scrutinee, if possible.
+        String inferredBase = inferBaseSortName(scrutinee);
+        contextualBaseStack.push(inferredBase == null ? "" : inferredBase);
+
+        try {
+            boolean braced = peek().kind() == CardinalToken.Kind.LBRACE;
+            if (braced) consume();
+
+            List<IrExpr.MatchBranch> branches = new ArrayList<>();
+            int defaultArmIndex = -1;
+            Origin defaultArmOrigin = null;
+            IrExpr defaultArmResult = null;
+
+            while (isMatchArmStart()) {
+                if (defaultArmIndex >= 0) {
+                    throw new ParseException(
+                            "Match arms after '_' default are not allowed; '_' must be the last arm",
+                            peek().origin());
+                }
+                if (isUnderscoreArm()) {
+                    CardinalToken underscore = consume();
+                    expect(CardinalToken.Kind.ARROW);
+                    IrExpr result = parseExpr();
+                    defaultArmIndex = branches.size();
+                    defaultArmOrigin = underscore.origin();
+                    defaultArmResult = result;
+                    // Placeholder pattern — replaced after the loop with the
+                    // computed complement of the other arms' predicates.
+                    branches.add(new IrExpr.MatchBranch(
+                            new IrSort.Named("__default_placeholder", underscore.origin()),
+                            result));
+                } else {
+                    IrSort pattern = parsePattern();
+                    expect(CardinalToken.Kind.ARROW);
+                    // The arm body is a clause: the pattern's leaf binders (the
+                    // destructure) scope the result (the production). Open clause —
+                    // the body also sees the enclosing scope; binders are saved/
+                    // restored per arm so they don't leak across arms (docs/arrows.md).
+                    IrExpr result = parseClauseBody(patternBinders(pattern), null, false);
+                    // `[_]` parses as the universal Named("_") — the bracketed
+                    // spelling of the default arm. Treat it exactly like bare `_`
+                    // so its region becomes the computed complement of the other
+                    // arms, not an unconstrained wildcard (otherwise a `[_]` arm
+                    // is strictly weaker than the equivalent explicit arm, and
+                    // proofs that should discharge over its region don't).
+                    if (pattern instanceof IrSort.Named u && u.name().equals("_")) {
+                        defaultArmIndex = branches.size();
+                        defaultArmOrigin = pattern.origin();
+                        defaultArmResult = result;
+                        branches.add(new IrExpr.MatchBranch(
+                                new IrSort.Named("__default_placeholder", pattern.origin()), result));
+                    } else {
+                        checkTupleArity(scrutinee, pattern);
+                        branches.add(new IrExpr.MatchBranch(pattern, result));
+                    }
+                }
+            }
+            if (braced) {
+                // A common mistake: writing an arm pattern as a bare constructor
+                // or literal (`A(v) -> ...`) instead of the required bracket-sort
+                // (`[A(v)] -> ...`). The arm loop stops at the unbracketed token,
+                // so without this the user sees a bewildering "Expected RBRACE".
+                if (peek().kind() != CardinalToken.Kind.RBRACE && looksLikeUnbracketedArm()) {
+                    throw new ParseException(
+                            "Match arm patterns must be written as bracket-sorts: '["
+                            + peek().text() + " ...] -> ...', not a bare '" + peek().text()
+                            + " ...'. Wrap the pattern in '[...]' (e.g. `[Point(x, y)] -> ...`,"
+                            + " `[@>0] -> ...`, or `_` for the default arm).",
+                            peek().origin());
+                }
+                expect(CardinalToken.Kind.RBRACE);
+            }
+
+            if (branches.isEmpty()) {
+                throw new ParseException(
+                        "Match expression must have at least one branch",
+                        start.origin());
+            }
+
+            // `_` desugar: replace the placeholder pattern with the complement
+            // of the other arms' union over the scrutinee's sort. After this,
+            // the IR sees only explicit refinements; totality holds by
+            // construction (the complement covers exactly the leftover values).
+            if (defaultArmIndex >= 0) {
+                IrSort defaultPattern = DefaultArmComplement.compute(
+                        inferScrutineeSort(scrutinee), branches, defaultArmIndex, defaultArmOrigin);
+                branches.set(defaultArmIndex,
+                        new IrExpr.MatchBranch(defaultPattern, defaultArmResult));
+            }
+
+            // Destructure desugar: for each structural-pattern branch, wrap
+            // the result with let-bindings so the pattern's field names refer
+            // to fields of the scrutinee. If the scrutinee isn't already a Var,
+            // wrap the entire match in an outer let so it's evaluated once.
+            return desugarStructuralDestructure(scrutinee, branches, start.origin());
+        } finally {
+            contextualBaseStack.pop();
+        }
+    }
+
+    /**
+     * Inline conditional {@code if c then a else b} — a full expression, valid
+     * anywhere a value is (the same positions as {@code match}, which it is sugar
+     * for). It lowers to a two-arm boolean match, so it reuses typing, receipts,
+     * {@code evalMatch}, and the totality machinery — no new IR node:
+     * <pre>
+     *   match (c)  [Bool: @] -&gt; a   _ -&gt; b
+     * </pre>
+     * {@code [Bool: @]} is the sub-sort of {@code Bool} whose refinement predicate
+     * is the value itself (= {@code {true}}); the ordered {@code _} complement is
+     * {@code {false}}. Totality holds by construction, so {@code else} is
+     * mandatory (there is no partial {@code if}). An {@code else if} chain falls
+     * out for free — the else-branch is any expression, including another {@code if}.
+     */
+    private IrExpr parseConditional() throws ParseException {
+        CardinalToken start = expectKeyword("if");
+        IrExpr cond = parseExpr();
+        expectKeyword("then");
+        IrExpr thenExpr = parseExpr();
+        expectKeyword("else");
+        IrExpr elseExpr = parseExpr();
+
+        Origin o = start.origin();
+        IrSort trueSort = new IrSort.Refined("Bool", new IrExpr.SelfRef(o), o);
+        List<IrExpr.MatchBranch> branches = new ArrayList<>();
+        branches.add(new IrExpr.MatchBranch(trueSort, thenExpr));
+        int defaultArmIndex = branches.size();
+        branches.add(new IrExpr.MatchBranch(
+                new IrSort.Named("__default_placeholder", o), elseExpr));
+
+        // Compute the `_` complement of `[Bool: @]` over Bool — precise
+        // (`[Bool: !@]`) where the kernel can, universal `_` otherwise. Same tail
+        // as parseMatch, so downstream sees a shape the totality checker knows.
+        IrSort defaultPattern = DefaultArmComplement.compute(
+                new IrSort.Named("Bool", o), branches, defaultArmIndex, o);
+        branches.set(defaultArmIndex, new IrExpr.MatchBranch(defaultPattern, elseExpr));
+        return desugarStructuralDestructure(cond, branches, o);
+    }
+
+    /**
+     * The iteration construct (docs/iteration.md §8), slice 1 — map + filter only.
+     * {@code iter(src).{value, accept, reject} { match value <arms> }} lowers to
+     * {@link IrExpr.Iterate}: destructured members pick outputs (accept/reject →
+     * streams; a bare-value arm → the default stream), and each arm's
+     * <em>disposition</em> ({@code accept(e)} / {@code reject(e)} / a bool /
+     * a bare value) becomes a write. REVISIT (docs/iteration.md §10): index,
+     * fold (current/next), group-by (put), the completed-iterator result, and the
+     * conservation checks are not in this slice.
+     */
+    /**
+     * Spread-ascription `&source:[transform]` (docs/stream-war.md §3, slice 2d-1):
+     * applies a per-element transform over a stream — the inline/anonymous face of
+     * {@code transform(&source)}. The leading {@code &} is already at {@code peek()}.
+     * Lowers identically to the call form by routing through {@link #lowerSpreadCall}
+     * ({@code &a:[frag]} ≡ {@code frag(&a)}). Today the transform must be an inline
+     * fragment literal; named/coercion transforms in the {@code [..]} are slice 2d-3.
+     */
+    private IrExpr parseSpreadAscription() throws ParseException {
+        CardinalToken start = peek();
+        Origin o = start.origin();
+        // Subject: a single `&stream`, or a parenthesized tuple of them `(&a, &b)` —
+        // the zip / fan-in form (docs/stream-war.md §3).
+        List<IrExpr> sources = new ArrayList<>();
+        if (peek().kind() == CardinalToken.Kind.LPAREN) {
+            consume();  // `(`
+            boolean first = true;
+            while (peek().kind() != CardinalToken.Kind.RPAREN) {
+                if (!first) expect(CardinalToken.Kind.COMMA);
+                if (peek().kind() == CardinalToken.Kind.OP && "&".equals(peek().text())) {
+                    consume();  // `&`
+                } else {
+                    throw new ParseException(
+                            "Each element of a `(&a, &b)` spread tuple must be a `&stream`; "
+                                    + "got '" + peek().text() + "'", peek().origin());
+                }
+                sources.add(parseExpr());  // stops at COMMA / RPAREN (neither is an OP)
+                first = false;
+            }
+            expect(CardinalToken.Kind.RPAREN);
+        } else {
+            consume();  // `&`
+            sources.add(parseExpr());  // stops at the COLON (not an OP)
+        }
+        expect(CardinalToken.Kind.COLON);
+        if (!looksLikeClause()) {
+            // The bracket is not a transform arrow/fragment — it is a bare TYPE-SORT,
+            // which makes `&s:[…]` a QUERY, not a per-element map (the membership /
+            // identity-transform branch of the spectrum; docs/stream-queries.md §1). A
+            // query is described-not-run; a terminal op chooses cardinality. Slice A
+            // supports `.first()` → [Present(T)|Absent] (docs/stream-queries.md §2.1).
+            if (peek().kind() == CardinalToken.Kind.LBRACKET) {
+                if (sources.size() > 1) {
+                    throw new ParseException(
+                            "A stream query `&s:[T:pred]` takes a single stream — a "
+                                    + "`(&a, &b)` zip query is not supported (docs/stream-queries.md)",
+                            o);
+                }
+                return parseQueryTerminal(sources.get(0), o);
+            }
+            throw new ParseException(
+                    "`&s:[…]` expects an inline transform (`[ (el:Int) -> … ]` / "
+                            + "`[Int -> @… -> R]`) or a type-sort query (`[T:pred]`) "
+                            + "(docs/arrows.md, docs/stream-war.md §3, docs/stream-queries.md)",
+                    peek().origin());
+        }
+        IrExpr.Lambda frag = parseClause();
+
+        // Multiple sources → zip (fan-in): route through lowerSpreadCall (the same
+        // path the call form `zip(&a, &b)` takes), wrapping each source as a spread.
+        if (sources.size() > 1) {
+            if (frag.params().size() != sources.size()) {
+                throw new ParseException(
+                        "A zip fragment takes one parameter per spread stream — got "
+                                + frag.params().size() + " parameter(s) for " + sources.size()
+                                + " streams; docs/stream-war.md §3", o);
+            }
+            List<IrExpr> markers = new ArrayList<>(sources.size());
+            for (IrExpr s : sources) markers.add(new IrExpr.Call(SPREAD_SENTINEL, List.of(s), o));
+            return maybeOnGpu(lowerSpreadCall(markers, a -> new IrExpr.Apply(frag, a, o), o), o);
+        }
+        IrExpr source = sources.get(0);
+        IrExpr spread = new IrExpr.Call(SPREAD_SENTINEL, List.of(source), o);
+        // Fan-out (fork): a tuple codomain of stream channels routes each element to
+        // one of several output streams (docs/stream-war.md §3). The codomain
+        // distinguishes this from a stream-of-tuples (a plain map with a tuple body
+        // and no codomain).
+        if (frag.returnSort() instanceof IrSort.Structural st
+                && TUPLE_SENTINEL.equals(st.name())
+                && st.members().values().stream().allMatch(this::isStreamChannelSort)) {
+            return maybeOnGpu(lowerSpreadFanout(source, frag, st, o), o);
+        }
+        // Guard-filter (docs/stream-war.md §3, RULED 2026-07-04): a domain-refined element
+        // binder is a PER-ELEMENT ADMITTANCE FILTER — emit while the element is in-domain,
+        // DROP (skip and continue) the ones that aren't. This is the "subscribe" semantic:
+        // an element that fails the refinement (wrong type or out of range) is never
+        // iterated, and downstream iterators never see it. It is NOT stream-ending — a
+        // later in-domain element still appears. Terminating the stream is a returned
+        // `Break` value (§3, slice 2b), never an input guard. The refinement is a CONSUMER
+        // semantic here; the generator's `(from,to)` refinement is a PRODUCER/synthesis
+        // semantic (§7.9), a different role — nothing to unify.
+        if (frag.params().size() == 1 && frag.params().get(0).sort() instanceof IrSort.Refined) {
+            return maybeOnGpu(lowerGuardFilter(source, frag, o), o);
+        }
+        return maybeOnGpu(lowerSpreadCall(List.of(spread),
+                a -> new IrExpr.Apply(frag, a, o), o), o);
+    }
+
+    /**
+     * Lowers a guard-filter (docs/stream-war.md §3, RULED 2026-07-04): {@code &s:[ (el:[G])
+     * -> body ]}. The binder's domain refinement {@code G} becomes the guard arm
+     * (in-domain → emit {@code body}); a catch-all arm with NO writes DROPS the
+     * out-of-domain element and continues (a bare drop, allowed because the default stream
+     * accounts for the channel — {@code SortChecker.checkIterationConservation}). Skip and
+     * continue, NOT halt: an in-domain element after an out-of-domain one is still emitted.
+     * (Contrast the {@link IrExpr.Write#STOP} halt, now reached only via a returned
+     * {@code Break} value.) Needs no {@code Nothing} value, so no {@code requires}. Reuses
+     * the source-driven {@code Iterate} engine + arm-matching; the refinement flowing into
+     * the output element sort ({@code Stream[T:G]}) is a follow-up (§8.6 imprecision, honest
+     * — the elements ARE {@code T}, just not narrowed).
+     */
+    /**
+     * The {@code … on Gpu} execution directive (docs/gpu-kernels.md): a postfix on a spread
+     * iteration that marks it to run as a GPU compute kernel instead of on the CPU. It changes
+     * <em>where</em> the iteration runs, not <em>what</em> it computes (identical value; the GPU is
+     * a strategy). {@code on}/{@code Gpu} are contextual — recognized only in this postfix position,
+     * so neither is a reserved word. Only a data-parallel iteration (a spread) can carry it; anything
+     * else is a parse error. (Kernel-shape eligibility — map/zip vs fold/fork — is checked when the
+     * kernel is lowered at dispatch, failing closed with a LoweringError, never a silent CPU run.)
+     */
+    private IrExpr maybeOnGpu(IrExpr result, Origin o) throws ParseException {
+        if (peek().kind() == CardinalToken.Kind.IDENT && "on".equals(peek().text())
+                && peek(1).kind() == CardinalToken.Kind.IDENT && "Gpu".equals(peek(1).text())) {
+            consume();  // `on`
+            consume();  // `Gpu`
+            if (!(result instanceof IrExpr.Iterate it)) {
+                throw new ParseException(
+                        "`on Gpu` requires a data-parallel iteration (a `&s:[…]` or `(&a, &b):[…]` "
+                                + "spread); got " + result.getClass().getSimpleName(), o);
+            }
+            return it.withGpu();
+        }
+        return result;
+    }
+
+    private IrExpr lowerGuardFilter(IrExpr source, IrExpr.Lambda frag, Origin o) {
+        String element = "$e" + (syntheticCounter++);
+        IrSort guard = frag.params().get(0).sort();
+        IrExpr body = new IrExpr.Apply(frag, List.of(new IrExpr.Var(element, o)), o);
+        IrExpr.OutputSpec out = new IrExpr.OutputSpec("default", IrExpr.OutputKind.STREAM, null);
+        IrExpr.Arm emit = new IrExpr.Arm(guard, List.of(new IrExpr.Write("default", null, body)));
+        IrExpr.Arm drop = new IrExpr.Arm(IrSort.named("_"), List.of());  // no writes → skip, continue
+        return new IrExpr.Iterate(source, element, List.of(out), List.of(emit, drop), o);
+    }
+
+    /**
+     * Parses the terminal op of a stream QUERY {@code &s:[T:pred].TERMINAL()}
+     * (docs/stream-queries.md §2). The bracket is a bare type-sort (membership), not a
+     * transform — so {@code &s:[T:pred]} <em>describes</em> a retrieval and a terminal op
+     * chooses the cardinality. Slice A implements {@code .first()} → the 0-or-1 scalar
+     * terminal returning {@code [Present(T)|Absent]}. The standalone {@code Query} value is
+     * not yet reified (Slice D), so a query must be terminated in place; a missing or unknown
+     * terminal is a helpful parse error rather than a silent map.
+     */
+    private IrExpr parseQueryTerminal(IrExpr source, Origin o) throws ParseException {
+        IrSort elemSort = parseSort();   // the `[T:pred]` membership sort
+        if (peek().kind() != CardinalToken.Kind.DOT || peek(1).kind() != CardinalToken.Kind.IDENT) {
+            throw new ParseException(
+                    "A stream query `&s:[T:pred]` must be terminated with a terminal op — "
+                            + "e.g. `.first()` (0-or-1) or `.all()` (0-or-many); a standalone "
+                            + "Query value is not yet supported (docs/stream-queries.md §2)",
+                    peek().origin());
+        }
+        CardinalToken termTok = peek(1);
+        String terminal = termTok.text();
+        consume();  // `.`
+        consume();  // the terminal name
+        expect(CardinalToken.Kind.LPAREN);
+        expect(CardinalToken.Kind.RPAREN);
+        // The terminal chooses cardinality (docs/stream-queries.md §2.2): `.first()` →
+        // 0-or-1 `[Present(T)|Absent]`; `.all()` → 0-or-many `Stream[T]` (the keyed.md
+        // "Restrict" face, materialized).
+        return switch (terminal) {
+            case "first" -> lowerQueryFirst(source, elemSort, o);
+            case "all" -> lowerQueryAll(source, elemSort, o);
+            default -> throw new ParseException(
+                    "Unknown query terminal `." + terminal + "()` — supported: `.first()` "
+                            + "(0-or-1), `.all()` (0-or-many) (docs/stream-queries.md §2.2)",
+                    termTok.origin());
+        };
+    }
+
+    /**
+     * Lowers {@code &s:[T:pred].first()} to a stop-at-first-hit scan (docs/stream-queries.md
+     * §5, Slice A). An {@code ACCUMULATOR} seeded to {@code Absent()} is set to the
+     * <b>bare matching element</b> on the first element that satisfies the membership sort,
+     * then the scan halts (a {@link IrExpr.Write#STOP} write in the same arm, after the
+     * accumulator write); no match leaves the accumulator {@code Absent}. So the result is the
+     * union {@code [T | Absent]} — the found element itself, or {@code Absent} — NOT a
+     * {@code Present(T)} wrapper. Consuming it is an ordinary type-guard match
+     * ({@code match r { [T] -> … [_] -> … }}), which needs no imported-struct destructure and
+     * hence no linker pass. Reuses the existing ACCUMULATOR + STOP engine primitives — no new
+     * disposition. The catch-all arm threads the accumulator unchanged (conservation: every
+     * arm accounts for the channel). Only {@code Absent} need be imported
+     * ({@code require cardinal.core.{Absent}}), and only because it is the miss value the scan
+     * seeds; the hit path introduces no nominal of its own.
+     *
+     * <p>NOTE: this Iterate's statically-inferred sort is the generic {@code Stream} (the
+     * default disposition sort), NOT {@code [T | Absent]}. The runtime value is correct (an
+     * element or {@code Absent}), but a two-arm {@code [T]}/{@code [Absent]} match can't yet
+     * be proven exhaustive from the static sort, so it needs a {@code [_]} catch-all.
+     * Narrowing the result sort to {@code [T | Absent]} (single-ACCUMULATOR Iterate
+     * result-sort inference = join of init + writes) is the follow-up that removes the
+     * catch-all.
+     */
+    private IrExpr lowerQueryFirst(IrExpr source, IrSort elemSort, Origin o) {
+        String element = "$q" + (syntheticCounter++);
+        // The miss value. IrExpr.Record (struct construction), NOT IrExpr.Call — a struct
+        // name is not a declared function, so a Call would fail CallNameCheck. Requires
+        // cardinal.core.{Absent} imported.
+        IrExpr absent = new IrExpr.Record("Absent", new LinkedHashMap<>(), o);
+        IrExpr.OutputSpec out = new IrExpr.OutputSpec("result", IrExpr.OutputKind.ACCUMULATOR, absent);
+        IrExpr.Arm hit = new IrExpr.Arm(elemSort, List.of(
+                new IrExpr.Write("result", null, new IrExpr.Var(element, o)),   // the bare element
+                // STOP's value is ignored (IrExpr.Write.STOP) but must be non-null.
+                new IrExpr.Write(IrExpr.Write.STOP, null, new IrExpr.Var(element, o))));
+        IrExpr.Arm miss = new IrExpr.Arm(IrSort.named("_"),
+                List.of(new IrExpr.Write("result", null, new IrExpr.Var("result", o))));
+        return new IrExpr.Iterate(source, element, List.of(out), List.of(hit, miss), o);
+    }
+
+    /**
+     * Lowers {@code &s:[T:pred].all()} to the 0-or-many query terminal (docs/stream-queries.md
+     * §2.2) — the materialized "Restrict" face (docs/keyed.md): a {@code STREAM} output emits
+     * every element that satisfies the membership sort and drops the rest, yielding
+     * {@code Stream[T]}. Structurally identical to the guard-filter ({@link #lowerGuardFilter}),
+     * but the emitted value is the bare element (no transform body) — a query selects, it does
+     * not map. Scan-correct; no index/pushdown yet (Slice C). Like the guard-filter, the result
+     * element sort stays the broad {@code Stream[T]} — the predicate does not yet narrow it.
+     */
+    private IrExpr lowerQueryAll(IrExpr source, IrSort elemSort, Origin o) {
+        String element = "$q" + (syntheticCounter++);
+        IrExpr.OutputSpec out = new IrExpr.OutputSpec("default", IrExpr.OutputKind.STREAM, null);
+        IrExpr.Arm emit = new IrExpr.Arm(elemSort,
+                List.of(new IrExpr.Write("default", null, new IrExpr.Var(element, o))));
+        IrExpr.Arm drop = new IrExpr.Arm(IrSort.named("_"), List.of());  // no writes → skip, continue
+        return new IrExpr.Iterate(source, element, List.of(out), List.of(emit, drop), o);
+    }
+
+    /** Whether {@code let NAME:} is followed by a fragment literal {@code [ (name: …) -> … ]}. */
+    private boolean looksLikeFragmentLiteral() {
+        return peek().kind() == CardinalToken.Kind.LBRACKET
+                && peek(1).kind() == CardinalToken.Kind.LPAREN
+                && peek(2).kind() == CardinalToken.Kind.IDENT
+                && peek(3).kind() == CardinalToken.Kind.COLON;
+    }
+
+    /**
+     * Whether {@code peek()} opens an <em>anonymous-{@code @} clause-chain</em>
+     * {@code [ A -> @… -> B ]} (docs/arrows.md "The unified clause-chain") — the
+     * conversion-sequence face: a one-input Lambda whose input is the anonymous
+     * {@code @}. It is the bracketed forms with a TOP-LEVEL arrow that are NOT the
+     * named-binder fragment {@code [ (x:T) -> … ]} nor the {@code [let …]} in-type
+     * pipeline nor a {@code [{…}]} tuple. A leading type checkpoint (bare ident or
+     * {@code [T]}) starts the chain (leading-{@code @} / literal forms deferred).
+     * The discriminator is the top-level {@code ->}: today no Method-sort /
+     * refinement / type-application carries one, so this never shadows an existing
+     * sort or fragment (minimal blast radius — slice S1).
+     */
+    private boolean looksLikeClauseChain() {
+        if (peek().kind() != CardinalToken.Kind.LBRACKET) return false;
+        if (looksLikeFragmentLiteral()) return false;                 // [ (x:T) -> …
+        if (peek(1).kind() == CardinalToken.Kind.LBRACE) return false;     // [{…}] tuple
+        if (peek(1).kind() == CardinalToken.Kind.IDENT
+                && peek(1).text().equals("let")) return false;        // [let …] pipeline
+        // Leading stage must look like a type checkpoint (bare ident or `[T]`).
+        if (peek(1).kind() != CardinalToken.Kind.IDENT
+                && peek(1).kind() != CardinalToken.Kind.LBRACKET) return false;
+        return chainHasTopLevelArrow();
+    }
+
+    /**
+     * True iff an {@code ->} occurs directly inside the {@code [ … ]} at
+     * {@code peek()} (bracket-depth 1, not nested in {@code (…)}/{@code {…}}/inner
+     * {@code […]}) — the clause-chain discriminator. Scans from the opening
+     * bracket to its match without consuming.
+     */
+    private boolean chainHasTopLevelArrow() {
+        int bracket = 0, paren = 0, brace = 0;
+        for (int i = 0; ; i++) {
+            CardinalToken.Kind k = peek(i).kind();
+            switch (k) {
+                case EOF -> { return false; }
+                case LBRACKET -> bracket++;
+                case RBRACKET -> { bracket--; if (bracket == 0) return false; }
+                case LPAREN -> paren++;
+                case RPAREN -> paren--;
+                case LBRACE -> brace++;
+                case RBRACE -> brace--;
+                case ARROW -> { if (bracket == 1 && paren == 0 && brace == 0) return true; }
+                default -> { }
+            }
+        }
+    }
+
+    /**
+     * Whether {@code peek()} opens a <em>value-producing clause</em> — the unified
+     * value-position entry (docs/arrows.md "The unified clause-chain", S3). Both
+     * faces lower to one {@link IrExpr.Lambda}: the named-binder fragment
+     * {@code [ (x:A) -> … ]} and the anonymous-{@code @} chain {@code [ A -> @… -> B ]}
+     * ("a named binder is just a named {@code @}"). Output kind is inferred from the
+     * FIRST stage: a leading param-list → the fragment branch; a leading type
+     * checkpoint → the chain branch. The two predicates are disjoint by construction.
+     */
+    private boolean looksLikeClause() {
+        return looksLikeFragmentLiteral() || looksLikeClauseChain();
+    }
+
+    /**
+     * Parse a value-producing clause (the unified value-position entry) to its
+     * {@link IrExpr.Lambda}: routes through the single {@link #parseClauseStages}
+     * parser and projects with {@link #asLambda}. Precondition:
+     * {@link #looksLikeClause()} holds (a named-binder fragment or an
+     * input-checkpoint-led chain — both yield a Value clause).
+     */
+    private IrExpr.Lambda parseClause() throws ParseException {
+        return asLambda(parseClauseStages());
+    }
+
+    /**
+     * The result of {@link #parseClauseStages} — the ONE clause grammar projected by
+     * POSITION (docs/arrows.md "The unified clause-chain"). An input-led clause
+     * (named-binder fragment or anonymous-{@code @} chain) is a {@code Value} (an
+     * {@link IrExpr.Lambda}); a closed clause (the {@code let …}-led in-type pipeline)
+     * is a {@code Sort} (an {@link IrSort.Refined}). A sort method cannot return a
+     * value, so the projection a caller asks for ({@link #asLambda}/{@link
+     * #asRefinedSort}) is its position's expectation; the mismatch is a clean error.
+     */
+    private sealed interface ParsedClause {
+        record Value(IrExpr.Lambda lambda) implements ParsedClause {}
+        record Sort(IrSort sort) implements ParsedClause {}
+    }
+
+    private IrExpr.Lambda asLambda(ParsedClause pc) throws ParseException {
+        if (pc instanceof ParsedClause.Value v) return v.lambda();
+        throw new ParseException("expected a value-producing clause (a fragment or "
+                + "conversion chain), not a sort-producing one", peek().origin());
+    }
+
+    private IrSort asRefinedSort(ParsedClause pc) throws ParseException {
+        if (pc instanceof ParsedClause.Sort s) return s.sort();
+        throw new ParseException("expected a sort-producing clause (the in-type "
+                + "pipeline), not a value-producing one", peek().origin());
+    }
+
+    /**
+     * THE unified clause parser (docs/arrows.md "The unified clause-chain") — ONE
+     * fold over a {@code [ stage -> … -> stage ]} sequence, threading the always-present
+     * running value {@code @}. Subsumes the named-binder fragment, the anonymous-{@code @}
+     * conversion chain, AND the in-type synthesis pipeline (it retired
+     * {@code parseFragmentLiteral}/{@code parseClauseChain}/{@code parsePipelineSort}).
+     *
+     * <p><b>{@code @} always has a value</b> (James 2026-06-25); stages MUTATE it, none
+     * "sets it from nothing". Two stage kinds, freely interleaved:
+     * <ul>
+     *   <li><b>binding</b> {@code let a (:S)? = b} — introduces a name, {@code @} unchanged;</li>
+     *   <li><b>production</b> {@code expr} — {@code @ := expr} (reads the prior {@code @}).
+     *       A {@code [Type]} is the <em>coercion</em> case of a production
+     *       ({@code @ := (Type : @)}, lowered to an {@link IrExpr.Cast}; identity when the
+     *       type already matches). A {@code [Base:pred]} refinement constrains {@code @} —
+     *       and its {@code @==w} conjunct, if any, <em>defines</em> {@code @} (the
+     *       value↔sort-witness bridge).</li>
+     * </ul>
+     *
+     * <p>The fold yields a final {@code @}-expression; the <b>projection is by POSITION</b>
+     * (one fold, two wrappers — there is no two-kinds-of-{@code @} duality):
+     * <ul>
+     *   <li><b>input-led</b> (named-binder {@code (x:A)} or anonymous checkpoint {@code [A]}
+     *       head) ⇒ a {@code Value}: {@code Lambda(input, finalAt)} — {@link #asLambda};</li>
+     *   <li><b>closed</b> ({@code let}- or production-led, no input) ⇒ a {@code Sort}:
+     *       {@code Refined(base, @==finalAt & constraints)} — {@link #asRefinedSort}.</li>
+     * </ul>
+     */
+    private ParsedClause parseClauseStages() throws ParseException {
+        CardinalToken open = expect(CardinalToken.Kind.LBRACKET);
+
+        // ---- HEAD: establish the input (if any). @ is the running value. ----
+        List<IrParam> params = new ArrayList<>();   // input params; empty ⇒ closed
+        List<ParamDestructure> destrs = null;
+        IrSort declaredCodomain = null;
+        String atVar = null;                        // the running-@ var (one input)
+        IrExpr cur = null;                          // the running @ value
+        IrSort currentType = null;
+        boolean freshScope = false;
+        List<IrStmt.RequireEntry> headDestr = null; // anonymous destructuring input
+        IrSort.Structural headDestrBase = null;
+        if (peek().kind() == CardinalToken.Kind.LPAREN) {
+            // Named-binder fragment head `(x:A, …) (:Codomain)? -> …`.
+            expect(CardinalToken.Kind.LPAREN);
+            params = parseParamList(CardinalToken.Kind.RPAREN);
+            expect(CardinalToken.Kind.RPAREN);
+            destrs = drainParamDestructures();
+            if (!drainParamConversions().isEmpty()) {
+                throw new ParseException("a conversion-clause param `(x:[A -> B])` inside a "
+                        + "fragment binder is not supported yet — use it on a function/method "
+                        + "param", open.origin());
+            }
+            if (peek().kind() == CardinalToken.Kind.COLON) { consume(); declaredCodomain = parseSort(); }
+            expect(CardinalToken.Kind.ARROW);
+            freshScope = true;                       // a fragment is a closed clause over its binders
+            if (params.size() == 1) {                // a single binder IS the named @
+                atVar = params.get(0).name();
+                cur = new IrExpr.Var(atVar, open.origin());
+                currentType = params.get(0).sort();
+            }
+        } else if (peek().kind() == CardinalToken.Kind.IDENT
+                && peek(1).kind() == CardinalToken.Kind.DOT
+                && peek(2).kind() == CardinalToken.Kind.LBRACE) {
+            // Destructuring anonymous input `[Base.{a, b} -> conv]`: @ is a Base whose
+            // fields are extracted into scope for the conversion body (the param-
+            // destructure shape, made a clause input — destructure/conversion duality).
+            CardinalToken baseTok = expect(CardinalToken.Kind.IDENT);
+            headDestr = parseDotBraceEntryList();
+            IrSort inputSort = new IrSort.Named(baseTok.text(), baseTok.origin());
+            headDestrBase = declaredStructShape(baseTok.text());
+            atVar = "$at" + (syntheticCounter++);
+            params = List.of(new IrParam(atVar, inputSort));
+            cur = new IrExpr.Var(atVar, open.origin());
+            currentType = inputSort;
+            expect(CardinalToken.Kind.ARROW);
+        } else if (peek().kind() == CardinalToken.Kind.IDENT && peek().text().equals("let")) {
+            // Closed `let`-led pipeline — no input head; the fold consumes the lets and
+            // the sort projection pins @. (`let` is the one head that is neither a sort
+            // nor a destructure.)
+        } else {
+            // The head is a SORT. A clause head is always a sort / destructure / let,
+            // NEVER a construction — so `Name{…}` / `Type{…}` here read as the
+            // construction-pin / trait SORT, not a value. (The `Name{…}`⇒production rule
+            // is a MIDDLE-stage rule only, applied by chainStageIsSort in the fold — the
+            // distinction is positional, not by brace content.)
+            IrSort inputSort = parseSort();
+            atVar = "$at" + (syntheticCounter++);
+            params = List.of(new IrParam(atVar, inputSort));
+            cur = new IrExpr.Var(atVar, open.origin());
+            currentType = inputSort;
+            expect(CardinalToken.Kind.ARROW);
+        }
+        boolean hasInput = !params.isEmpty();
+
+        // ---- FOLD: stages mutate @ (cur) and accumulate lets / a sort pin. ----
+        Map<String, IrSort> savedScope = new LinkedHashMap<>(currentScope);
+        List<String> bn = new ArrayList<>();        // interleaved let bindings
+        List<IrSort> bs = new ArrayList<>();
+        List<IrExpr> bv = new ArrayList<>();
+        String pinBase = null;                      // sort projection: Base of a refinement stage
+        IrExpr constraints = null;                  // sort projection: non-@== refinement conjuncts
+        try {
+            if (freshScope) currentScope.clear();
+            for (IrParam p : params) currentScope.put(p.name(), p.sort());
+            if (destrs != null && !destrs.isEmpty()) bindParamDestructures(destrs);
+            // Seed the destructuring-input fields as `let <local> = @.<field>` bindings
+            // so the conversion body resolves them (a = @.a, b = @.b).
+            if (headDestr != null) {
+                for (IrStmt.RequireEntry e : headDestr) {
+                    IrSort fieldSort = headDestrBase != null
+                            && headDestrBase.members().get(e.remoteName()) != null
+                            ? headDestrBase.members().get(e.remoteName())
+                            : IrSort.named("_");
+                    bn.add(e.localName());
+                    bs.add(fieldSort);
+                    bv.add(new IrExpr.FieldAccess(
+                            new IrExpr.Var(atVar, open.origin()), e.remoteName(), open.origin()));
+                    currentScope.put(e.localName(), fieldSort);
+                }
+            }
+            boolean done = false;
+            while (!done) {
+                if (peek().kind() == CardinalToken.Kind.IDENT && peek().text().equals("let")) {
+                    // binding stage: names only, @ unchanged.
+                    consume();
+                    CardinalToken n = expect(CardinalToken.Kind.IDENT);
+                    IrSort s = null;
+                    if (peek().kind() == CardinalToken.Kind.COLON) { consume(); s = parseSort(); }
+                    expect(CardinalToken.Kind.EQUALS);
+                    IrExpr e = cur != null ? substituteSelf(parseExpr(), cur) : parseExpr();
+                    IrSort bindSort = s != null ? s : inference.maximalSort(e);
+                    bn.add(n.text());
+                    bs.add(bindSort);
+                    bv.add(e);
+                    currentScope.put(n.text(), bindSort);
+                } else if (chainStageIsSort()) {
+                    // a sort stage: a coercion (Named) or a refinement/pin (Refined).
+                    IrSort stageSort = parseBracketBranch();
+                    if (stageSort instanceof IrSort.Refined r) {
+                        IrExpr witness = definitionWitness(r.predicate());
+                        if (witness != null) cur = witness;          // @==w DEFINES @
+                        IrExpr rest = removeDefinitionConjunct(r.predicate());
+                        if (rest != null) {
+                            constraints = constraints == null ? rest
+                                    : new IrExpr.BinOp(IrExpr.Op.AND, constraints, rest, open.origin());
+                        }
+                        pinBase = baseSortName(r);
+                        currentType = r;
+                    } else {                                         // a `[Type]` coercion of @
+                        if (cur != null && !sameBase(currentType, stageSort)) {
+                            cur = new IrExpr.Cast(stageSort, cur, open.origin());
+                        }
+                        currentType = stageSort;
+                    }
+                } else {
+                    // production stage: @ := expr.
+                    IrExpr e = parseExpr();
+                    cur = cur != null ? substituteSelf(e, cur) : e;
+                    currentType = inference.maximalSort(cur);
+                }
+                if (atVar != null) currentScope.put(atVar, currentType);
+                if (peek().kind() == CardinalToken.Kind.ARROW) consume();
+                else done = true;
+            }
+        } finally {
+            currentScope.clear();
+            currentScope.putAll(savedScope);
+        }
+        CardinalToken close = expect(CardinalToken.Kind.RBRACKET);
+
+        // A clause must establish @ — an input head, a production, or a pin. Only
+        // bindings (`[let r = 5]`, no terminus) leaves it unset: a clean error, not an
+        // NPE in the body construction below.
+        if (cur == null) {
+            throw new ParseException(
+                    "a clause must produce a value — this one has only bindings and no "
+                            + "terminus production or pin", close.origin());
+        }
+
+        // Wrap the interleaved lets around the running value (first outermost), then the
+        // fragment's param-destructure locals around that.
+        IrExpr body = cur;
+        for (int i = bn.size() - 1; i >= 0; i--) {
+            body = new IrExpr.LetIn(bn.get(i), bs.get(i), bv.get(i), body, open.origin());
+        }
+        if (destrs != null && !destrs.isEmpty()) body = wrapParamDestructures(body, destrs);
+
+        if (hasInput) {
+            IrSort returnSort = declaredCodomain != null ? declaredCodomain
+                    : currentType != null ? currentType : inference.maximalSort(body);
+            return new ParsedClause.Value(
+                    new IrExpr.Lambda(params, returnSort, body, open.spanTo(close)));
+        }
+        // Closed → a sort: `[Base: @==finalAt (& constraints)]` (the in-type pipeline).
+        String base = pinBase != null ? pinBase : baseSortName(inference.maximalSort(body));
+        IrExpr defPred = new IrExpr.BinOp(
+                IrExpr.Op.EQ, new IrExpr.SelfRef(open.origin()), body, open.origin());
+        IrExpr fullPred = constraints == null
+                ? defPred
+                : new IrExpr.BinOp(IrExpr.Op.AND, defPred, constraints, open.origin());
+        return new ParsedClause.Sort(new IrSort.Refined(base, fullPred, open.spanTo(close)));
+    }
+
+    /** Whether two sorts share a base name (both known). */
+    private boolean sameBase(IrSort a, IrSort b) {
+        String ba = baseSortName(a);
+        String bb = baseSortName(b);
+        return ba != null && ba.equals(bb);
+    }
+
+    /**
+     * Whether the stage at {@code peek()} is a sort (a coercion {@code [Type]}/{@code Type}
+     * or a refinement {@code [Base:pred]}/{@code Base:pred}) rather than a value production:
+     * a leading {@code [}, or a capitalized name that is NOT a constructor call
+     * ({@code Name(…)} — that is a production). Capitalization is the non-load-bearing hint;
+     * the bracket is the unambiguous form (docs/arrows.md).
+     */
+    private boolean chainStageIsSort() {
+        if (peek().kind() == CardinalToken.Kind.LBRACKET) return true;
+        if (peek().kind() == CardinalToken.Kind.IDENT) {
+            String t = peek().text();
+            // A capitalized name that is NOT a constructor call `Name(…)` nor a
+            // construction literal `Name{…}` (both are value productions).
+            return !t.isEmpty() && Character.isUpperCase(t.charAt(0))
+                    && peek(1).kind() != CardinalToken.Kind.LPAREN
+                    && peek(1).kind() != CardinalToken.Kind.LBRACE;
+        }
+        return false;
+    }
+
+    private IrExpr parseIter() throws ParseException {
+        CardinalToken start = consume();  // `iter`
+        expect(CardinalToken.Kind.LPAREN);
+        IrExpr source = parseExpr();
+        expect(CardinalToken.Kind.RPAREN);
+        // `.{ members }` — the capability set (slice 1: value / accept / reject).
+        expect(CardinalToken.Kind.DOT);
+        expect(CardinalToken.Kind.LBRACE);
+        java.util.LinkedHashSet<String> members = new java.util.LinkedHashSet<>();
+        boolean first = true;
+        while (peek().kind() != CardinalToken.Kind.RBRACE) {
+            if (!first) expect(CardinalToken.Kind.COMMA);
+            CardinalToken m = expect(CardinalToken.Kind.IDENT);
+            if (!java.util.Set.of("value", "accept", "reject").contains(m.text())) {
+                throw new ParseException(
+                        "Iterator member '" + m.text() + "' is not supported yet — slice 1 "
+                                + "is map+filter (value, accept, reject); docs/iteration.md §10",
+                        m.origin());
+            }
+            members.add(m.text());
+            first = false;
+        }
+        expect(CardinalToken.Kind.RBRACE);
+        if (!members.contains("value")) {
+            throw new ParseException(
+                    "Iterator block must destructure `value` (the current element)", start.origin());
+        }
+        // Element-sort inference (so refinement-pattern shorthands like `[0]` /
+        // `[@>1]` get a base): a stream is a positional record (a tuple literal
+        // `(1,2,3)`), so the element sort is its first member's. REVISIT
+        // (docs/iteration.md §10): real element-type inference from the Source
+        // contract (heterogeneous streams, non-literal sources).
+        IrSort valueSort = null;
+        if (inference.maximalSort(source) instanceof IrSort.Structural st && !st.members().isEmpty()) {
+            // The element's BASE sort, not the first member's value-singleton:
+            // `value` ranges over every element, so it must not inherit the first
+            // literal's refinement (e.g. [Int:@==1]) — that would over-narrow the
+            // scrutinee and, now that `[_]` is the complement within the
+            // scrutinee's sort, make a `[_]` arm match only the first element.
+            String base = baseSortName(st.members().values().iterator().next());
+            if (base != null) valueSort = IrSort.named(base);
+        }
+        // `{ match value <arms> }` — `value` scoped so the match infers its base.
+        Map<String, IrSort> savedScope = new LinkedHashMap<>(currentScope);
+        if (valueSort != null) currentScope.put("value", valueSort);
+        IrExpr body;
+        CardinalToken end;
+        try {
+            expect(CardinalToken.Kind.LBRACE);
+            body = parseMatch();
+            end = expect(CardinalToken.Kind.RBRACE);
+        } finally {
+            currentScope.clear();
+            currentScope.putAll(savedScope);
+        }
+        if (!(body instanceof IrExpr.Match matchExpr)) {
+            throw new ParseException("Iterator block body must be a `match`", start.origin());
+        }
+        String element = matchExpr.scrutinee() instanceof IrExpr.Var v ? v.name() : "value";
+
+        boolean usesAccept = false, usesReject = false, usesDefault = false;
+        List<IrExpr.Arm> arms = new ArrayList<>(matchExpr.branches().size());
+        for (IrExpr.MatchBranch b : matchExpr.branches()) {
+            IrExpr.Write w = lowerDisposition(b.result(), element, members, start.origin());
+            switch (w.output()) {
+                case "accept" -> usesAccept = true;
+                case "reject" -> usesReject = true;
+                default -> usesDefault = true;
+            }
+            arms.add(new IrExpr.Arm(b.pattern(), List.of(w)));
+        }
+        List<IrExpr.OutputSpec> outputs = new ArrayList<>();
+        if (usesDefault) outputs.add(new IrExpr.OutputSpec("default", IrExpr.OutputKind.STREAM, null));
+        if (usesAccept) outputs.add(new IrExpr.OutputSpec("accept", IrExpr.OutputKind.STREAM, null));
+        if (usesReject) outputs.add(new IrExpr.OutputSpec("reject", IrExpr.OutputKind.STREAM, null));
+        return new IrExpr.Iterate(source, element, outputs, arms, start.spanTo(end));
+    }
+
+    /**
+     * Lowers one arm's <em>disposition</em> expression to a write. {@code accept(e)}
+     * / {@code reject(e)} (or no-arg, routing the current element) → a write to
+     * that stream; a bool routes the current element (skip — legal because filter
+     * is in scope); anything else is a bare value → the default (map) stream.
+     */
+    private IrExpr.Write lowerDisposition(
+            IrExpr r, String element, java.util.Set<String> members, Origin o) throws ParseException {
+        String verb = null;
+        IrExpr arg = null;
+        if (r instanceof IrExpr.Apply ap && ap.fn() instanceof IrExpr.Var fv
+                && (fv.name().equals("accept") || fv.name().equals("reject"))) {
+            verb = fv.name();
+            arg = ap.args().isEmpty() ? new IrExpr.Var(element, o) : ap.args().get(0);
+        } else if (r instanceof IrExpr.Call c
+                && (c.functionName().equals("accept") || c.functionName().equals("reject"))) {
+            verb = c.functionName();
+            arg = c.args().isEmpty() ? new IrExpr.Var(element, o) : c.args().get(0);
+        } else if (r instanceof IrExpr.Bool bl) {
+            verb = bl.value() ? "accept" : "reject";  // bool = skip disposition
+            arg = new IrExpr.Var(element, o);
+        }
+        if (verb != null) {
+            if (!members.contains(verb)) {
+                throw new ParseException(
+                        "Arm uses `" + verb + "` but it is not destructured in `.{…}`", o);
+            }
+            return new IrExpr.Write(verb, null, arg);
+        }
+        return new IrExpr.Write("default", null, r);  // bare value → default (map) stream
+    }
+
+    /** True if the next token starts a match arm — either `[` or the `_` default. */
+    private boolean isMatchArmStart() {
+        return peek().kind() == CardinalToken.Kind.LBRACKET || isUnderscoreArm();
+    }
+
+    /**
+     * Heuristic for the "forgot the brackets" match-arm mistake: the current
+     * token begins something pattern-shaped (an identifier, {@code (}, or a
+     * literal) and an {@code ->} follows before the enclosing {@code }} — i.e.
+     * the user wrote {@code A(v) -> ...} where {@code [A(v)] -> ...} is required.
+     * Bounded lookahead so a genuinely broken tail doesn't scan forever.
+     */
+    private boolean looksLikeUnbracketedArm() {
+        CardinalToken t = peek();
+        boolean patternish = switch (t.kind()) {
+            case IDENT, LPAREN, INTEGER, DECIMAL, STRING, CHAR -> true;
+            case OP -> t.text().equals("-"); // a negative-literal pattern like -1
+            default -> false;
+        };
+        if (!patternish) return false;
+        for (int i = 0; i < 32; i++) {
+            CardinalToken.Kind k = peek(i).kind();
+            if (k == CardinalToken.Kind.ARROW) return true;
+            if (k == CardinalToken.Kind.RBRACE || k == CardinalToken.Kind.EOF) return false;
+        }
+        return false;
+    }
+
+    /** True if the next token is the `_` default-arm marker (an IDENT with text "_"). */
+    private boolean isUnderscoreArm() {
+        CardinalToken t = peek();
+        return t.kind() == CardinalToken.Kind.IDENT && t.text().equals("_");
+    }
+
+    /** Returns the scrutinee's IrSort if it's a known in-scope Var; null otherwise. */
+    private IrSort inferScrutineeSort(IrExpr expr) {
+        if (expr instanceof IrExpr.Var v) {
+            return currentScope.get(v.name());
+        }
+        return null;
+    }
+
+    /**
+     * If any branch's pattern is structural, wrap the branch result with
+     * {@code let field = scrutinee.field in ...} for each field, so the
+     * pattern's field names are bound in the branch's result.
+     */
+    /**
+     * Whether {@code sp} is a deferred (cross-module) positional struct pattern —
+     * its struct was not in {@link #types} at parse time, so its slots
+     * are positional and {@code DestructureResolver} owns the post-link desugar.
+     */
+    private boolean isDeferredPattern(IrSort.Structural sp) {
+        return deferredStructPatterns.contains(sp);
+    }
+
+    /** True if {@code s} is a deferred-slot placeholder ({@code _$bind$x}/{@code _$skip$}). */
+    private static boolean isDeferredEncodedSort(IrSort s) {
+        return s instanceof IrSort.Named n
+                && (n.name().startsWith(DEFERRED_BIND) || n.name().startsWith(DEFERRED_SKIP));
+    }
+
+    private IrExpr desugarStructuralDestructure(
+            IrExpr scrutinee,
+            List<IrExpr.MatchBranch> branches,
+            Origin matchOrigin) {
+        boolean anyStructural = branches.stream().anyMatch(
+                b -> b.pattern() instanceof IrSort.Structural);
+        if (!anyStructural) {
+            return new IrExpr.Match(scrutinee, branches, matchOrigin);
+        }
+        boolean needsOuterLet = !(scrutinee instanceof IrExpr.Var);
+        String outerLetName = null;
+        IrExpr scrutineeRef;
+        if (needsOuterLet) {
+            outerLetName = "__scrutinee$" + (syntheticCounter++);
+            scrutineeRef = new IrExpr.Var(outerLetName, Origin.NONE);
+        } else {
+            scrutineeRef = scrutinee;
+        }
+        List<IrExpr.MatchBranch> wrapped = new ArrayList<>(branches.size());
+        for (IrExpr.MatchBranch b : branches) {
+            IrExpr result = b.result();
+            // A DEFERRED (cross-module) struct pattern is left unwrapped here: its
+            // slots are positional and the struct's field names are unknown until
+            // link time, so DestructureResolver does the let-binding wrap post-link
+            // (reading match.scrutinee(), which is always a Var after this method).
+            if (b.pattern() instanceof IrSort.Structural sp && !isDeferredPattern(sp)) {
+                result = wrapDestructureBindings(
+                        sp, scrutineeRef, inference.maximalSort(scrutinee), result);
+            }
+            IrSort pattern = b.pattern();
+            // A native-anatomy pattern ([Decimal(u, s)]) matches the CARRIER,
+            // not a record — the arm's sort becomes the bare nominal name (the
+            // destructure is irrefutable: every carrier has a canonical
+            // anatomy), or a refinement over the anatomy when fields are
+            // literal-constrained ([Decimal(25, s)] → [Decimal:@.unscaled==25]).
+            if (b.pattern() instanceof IrSort.Structural sp
+                    && sibarum.cardinal.ir.NativeConstructors.has(sp.name())) {
+                IrExpr conjunct = null;
+                for (Map.Entry<String, IrSort> e : sp.members().entrySet()) {
+                    if (!(e.getValue() instanceof IrSort.Refined rf)) continue;
+                    IrExpr p = selfToFieldAccess(rf.predicate(), e.getKey());
+                    conjunct = conjunct == null ? p
+                            : new IrExpr.BinOp(IrExpr.Op.AND, conjunct, p, Origin.NONE);
+                }
+                pattern = conjunct == null
+                        ? IrSort.named(sp.name())
+                        : new IrSort.Refined(sp.name(), conjunct, Origin.NONE);
+            }
+            wrapped.add(new IrExpr.MatchBranch(pattern, result));
+        }
+        IrExpr match = new IrExpr.Match(scrutineeRef, wrapped, matchOrigin);
+        if (!needsOuterLet) return match;
+        // Thread the scrutinee's inferred sort through the outer let so the
+        // placeholder "_" sentinel doesn't leak into the compiled module's
+        // sort table. Falls back to "_" only when nothing tighter is known
+        // (record-literal scrutinees give Structural, calls give the
+        // callee's return, etc.).
+        IrSort scrutineeSort = inference.maximalSort(scrutinee);
+        return new IrExpr.LetIn(outerLetName, scrutineeSort, scrutinee, match, matchOrigin);
+    }
+
+    /**
+     * Wraps {@code result} with the let-bindings a structural pattern
+     * introduces, threading the {@code accessPath} so NESTED struct patterns
+     * bind too: in {@code [(Traction(n1,z1), Traction(n2,z2))]} the element
+     * {@code Traction(n1,z1)} binds {@code n1 = scrutinee._0.n},
+     * {@code z1 = scrutinee._0.zexp}. Reverse order so the first field is the
+     * outermost let. A literal-/{@code _}-constrained field constrains the match
+     * but binds nothing (skipped, so the name isn't silently shadowed); a
+     * member that is itself a Structural pattern recurses regardless.
+     */
+    private IrExpr wrapDestructureBindings(
+            IrSort.Structural sp, IrExpr accessPath, IrSort accessSort, IrExpr result) {
+        java.util.Set<String> constrainedOnly =
+                literalConstrainedFields.getOrDefault(sp, java.util.Set.of());
+        Map<String, String> renames = destructureRenames.getOrDefault(sp, Map.of());
+        // A tuple pattern's member sorts are the placeholder `_` (resolved from
+        // the scrutinee); recover the real element sort from the scrutinee's
+        // inferred sort so a tuple binder used as a method receiver (`i.bump()`
+        // in [(i, k)] over (Inner, Int)) is typed, not stuck at `_`.
+        Map<String, IrSort> accessMembers = accessSort instanceof IrSort.Structural as
+                ? as.members() : Map.of();
+        List<Map.Entry<String, IrSort>> entries = new ArrayList<>(sp.members().entrySet());
+        for (int i = entries.size() - 1; i >= 0; i--) {
+            Map.Entry<String, IrSort> e = entries.get(i);
+            IrExpr fieldAccess = new IrExpr.FieldAccess(accessPath, e.getKey(), Origin.NONE);
+            IrSort elemSort = accessMembers.get(e.getKey());
+            if (e.getValue() instanceof IrSort.Structural nested) {
+                // A DEFERRED nested struct (cross-module, e.g. the Vec of
+                // [(Vec(x,y), c)]) has positional slots whose field names aren't
+                // known yet — leave its bindings to DestructureResolver, which
+                // descends from this same access path post-link.
+                if (!isDeferredPattern(nested)) {
+                    result = wrapDestructureBindings(nested, fieldAccess, elemSort, result);
+                }
+            } else if (constrainedOnly.contains(e.getKey())) {
+                // literal / `_` constraint: matches, binds nothing.
+                continue;
+            } else {
+                IrSort binderSort = isUnknownSort(e.getValue()) && elemSort != null
+                        ? elemSort : e.getValue();
+                result = new IrExpr.LetIn(
+                        renames.getOrDefault(e.getKey(), e.getKey()),
+                        binderSort,
+                        fieldAccess,
+                        result,
+                        Origin.NONE);
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Best-effort base-sort name for a scrutinee expression. Returns {@code null}
+     * if no base can be inferred (the scrutinee isn't a Var in scope, or is a
+     * non-named sort like Function). The contextual {@code [pred]} arm form
+     * then becomes an error inside this match.
+     */
+    private String inferBaseSortName(IrExpr expr) {
+        if (expr instanceof IrExpr.Var v) {
+            IrSort s = currentScope.get(v.name());
+            if (s != null) return baseSortName(s);
+        }
+        return null;
+    }
+
+
+    private List<IrExpr> parseArgList() throws ParseException {
+        List<IrExpr> args = new ArrayList<>();
+        if (peek().kind() == CardinalToken.Kind.RPAREN) return args;
+        args.add(parseArg());
+        while (peek().kind() == CardinalToken.Kind.COMMA) {
+            consume();
+            args.add(parseArg());
+        }
+        return args;
+    }
+
+    /**
+     * Reserved callee name for the transient <em>spread</em> marker: a {@code &expr}
+     * argument is wrapped as {@code Call(SPREAD_SENTINEL, [source])} so it rides the
+     * existing {@code List<IrExpr>} arg shape without a new IR variant. It never
+     * survives parsing — {@link #lowerSpreadCall} consumes every spread when the
+     * enclosing call is built. The {@code &} can't appear in a user identifier, so
+     * the name can't collide.
+     */
+    private static final String SPREAD_SENTINEL = "&spread";
+
+    /**
+     * One call argument, recognizing the stream-<em>spread</em> prefix {@code &expr}
+     * (docs/stream-war.md §3). A leading {@code &} at the start of an argument is
+     * unambiguous — binary {@code &} (refinement conjunction) only occurs inside a
+     * refinement bracket, never as an expression head — so it marks the argument as
+     * a per-element spread over a stream. Anything else is an ordinary argument.
+     */
+    private IrExpr parseArg() throws ParseException {
+        if (peek().kind() == CardinalToken.Kind.OP && "&".equals(peek().text())) {
+            CardinalToken amp = consume();
+            IrExpr source = parseExpr();
+            return new IrExpr.Call(SPREAD_SENTINEL, List.of(source), amp.origin());
+        }
+        return parseExpr();
+    }
+
+    private static boolean isSpread(IrExpr arg) {
+        return arg instanceof IrExpr.Call c && SPREAD_SENTINEL.equals(c.functionName());
+    }
+
+    private static boolean anySpread(List<IrExpr> args) {
+        return args.stream().anyMatch(CardinalParser::isSpread);
+    }
+
+    /**
+     * Lowers a call carrying a {@code &}-spread argument to an {@link IrExpr.Iterate}
+     * — the synthesis-fragment primitive, slice 2a (docs/stream-war.md §3, the
+     * single-stream <em>map</em> shape). {@code rebuild} reconstructs the underlying
+     * call form (a {@code Call}, {@code Apply}, or {@code MethodCall}) given the
+     * per-element argument list; the one spread position is replaced by the bound
+     * element, and the whole call becomes the body of a one-output stream iteration:
+     * each element of the source is mapped through the function and emitted.
+     *
+     * <p>Exactly one spread is the map shape; multiple spreads (zip) and tuple-return
+     * fan-out are later sub-slices, rejected here with a pointer.
+     */
+    private IrExpr lowerSpreadCall(
+            List<IrExpr> args, java.util.function.Function<List<IrExpr>, IrExpr> rebuild, Origin o)
+            throws ParseException {
+        List<Integer> spreadPositions = new ArrayList<>();
+        for (int i = 0; i < args.size(); i++) {
+            if (isSpread(args.get(i))) spreadPositions.add(i);
+        }
+        if (spreadPositions.isEmpty()) return rebuild.apply(args);
+
+        // Multiple spreads → zip (fan-in): the streams are walked in lockstep
+        // (docs/stream-war.md §3). The element binds to a tuple of the i-th value from
+        // each, which the fragment destructures via `._N`. Works for both faces — the
+        // call form `zip(&a, &b)` and the ascription `(&a, &b):[…]` route here.
+        if (spreadPositions.size() > 1) {
+            if (spreadPositions.size() != args.size()) {
+                throw new ParseException(
+                        "zip mixed with accumulator/constant args is not implemented yet — "
+                                + "every argument must be a `&stream`; docs/stream-war.md §3", o);
+            }
+            List<IrExpr> sources = new ArrayList<>(args.size());
+            for (IrExpr a : args) sources.add(((IrExpr.Call) a).args().get(0));
+            String elem = "$e" + (syntheticCounter++);
+            List<IrExpr> perElement = new ArrayList<>(args.size());
+            for (int i = 0; i < args.size(); i++) {
+                perElement.add(new IrExpr.FieldAccess(new IrExpr.Var(elem, o), "_" + i, o));
+            }
+            IrExpr zipBody = rebuild.apply(perElement);
+            IrExpr.OutputSpec zipOut = new IrExpr.OutputSpec("default", IrExpr.OutputKind.STREAM, null);
+            IrExpr.Arm zipArm = new IrExpr.Arm(
+                    IrSort.named("_"), List.of(new IrExpr.Write("default", null, zipBody)));
+            List<IrExpr> coSources = new ArrayList<>(sources.subList(1, sources.size()));
+            return new IrExpr.Iterate(sources.get(0), coSources, elem, List.of(zipOut), List.of(zipArm), o);
+        }
+
+        int spreadAt = spreadPositions.get(0);
+        IrExpr source = ((IrExpr.Call) args.get(spreadAt)).args().get(0);
+        String element = "$e" + (syntheticCounter++);
+
+        // Single stream, no other args → the single-channel map/filter shape: the
+        // fragment's return is the (one) stream's per-element emission.
+        if (args.size() == 1) {
+            IrExpr body = rebuild.apply(List.of(new IrExpr.Var(element, o)));
+            IrExpr.OutputSpec out = new IrExpr.OutputSpec("default", IrExpr.OutputKind.STREAM, null);
+            IrExpr.Arm arm = new IrExpr.Arm(
+                    IrSort.named("_"), List.of(new IrExpr.Write("default", null, body)));
+            return new IrExpr.Iterate(source, element, List.of(out), List.of(arm), o);
+        }
+
+        // Multi-channel (fold/scan): one output per input position — the spread is a
+        // STREAM channel, every other (value) arg is an ACCUMULATOR seeded by that
+        // value (the total-input-marker rule, docs/stream-war.md §3: a positional
+        // value is always an accumulator; constants are closed over). Output arity =
+        // input arity; the fragment returns a tuple, fan-distributed to the channels.
+        // Each accumulator's current revision is threaded back in as the matching
+        // argument (read via the iteration frame under the output's name).
+        List<IrExpr.OutputSpec> outputs = new ArrayList<>(args.size());
+        List<IrExpr> perElement = new ArrayList<>(args.size());
+        for (int i = 0; i < args.size(); i++) {
+            String ch = "_" + i;
+            if (i == spreadAt) {
+                outputs.add(new IrExpr.OutputSpec(ch, IrExpr.OutputKind.STREAM, null));
+                perElement.add(new IrExpr.Var(element, o));
+            } else {
+                outputs.add(new IrExpr.OutputSpec(ch, IrExpr.OutputKind.ACCUMULATOR, args.get(i)));
+                perElement.add(new IrExpr.Var(ch, o));
+            }
+        }
+        IrExpr body = rebuild.apply(perElement);
+        IrExpr.Arm arm = new IrExpr.Arm(
+                IrSort.named("_"), List.of(new IrExpr.Write(IrExpr.Write.FAN, null, body)));
+        return new IrExpr.Iterate(source, element, outputs, List.of(arm), o);
+    }
+
+    /** Whether a codomain channel sort is a stream channel ({@code Stream[T]}) vs an accumulator (bare {@code T}). */
+    private boolean isStreamChannelSort(IrSort s) {
+        return "Stream".equals(baseSortName(s));
+    }
+
+    /**
+     * Lowers a fan-out (fork): {@code &s:[ (el):(Stream[T], Stream[U]) -> (a, b) ]}
+     * — one stream in, several streams out (docs/stream-war.md §3). The codomain's
+     * tuple positions are the output streams; the per-element fragment returns a
+     * tuple, fan-distributed so each element is routed (a {@code null} position drops,
+     * so routing each element to exactly one output is the conservative split). The
+     * fragment takes the single element as its one parameter.
+     */
+    private IrExpr lowerSpreadFanout(
+            IrExpr source, IrExpr.Lambda frag, IrSort.Structural codomain, Origin o)
+            throws ParseException {
+        if (frag.params().size() != 1) {
+            throw new ParseException(
+                    "A fan-out fragment over one stream takes exactly one parameter (the "
+                            + "element); got " + frag.params().size()
+                            + " — multi-input fan-out is a later slice; docs/stream-war.md §3", o);
+        }
+        String element = "$e" + (syntheticCounter++);
+        List<IrExpr.OutputSpec> outputs = new ArrayList<>();
+        int i = 0;
+        for (String key : codomain.members().keySet()) {
+            outputs.add(new IrExpr.OutputSpec("_" + i, IrExpr.OutputKind.STREAM, null));
+            i++;
+        }
+        IrExpr body = new IrExpr.Apply(frag, List.of(new IrExpr.Var(element, o)), o);
+        IrExpr.Arm arm = new IrExpr.Arm(
+                IrSort.named("_"), List.of(new IrExpr.Write(IrExpr.Write.FAN, null, body)));
+        return new IrExpr.Iterate(source, element, outputs, List.of(arm), o);
+    }
+
+    /**
+     * Builds a tuple literal: a {@link IrExpr.Record} carrying the reserved
+     * {@code "_tuple"} sentinel name and positional keys {@code _0 .. _n}.
+     * Tuples are anonymous positional aggregates — the positional sibling of
+     * the {@code "_record"} sentinel — so they ride the existing record
+     * substrate with no dedicated IR node.
+     */
+    private IrExpr buildTupleLiteral(List<IrExpr> elems, Origin origin) {
+        Map<String, IrExpr> members = new LinkedHashMap<>();
+        for (int i = 0; i < elems.size(); i++) {
+            members.put("_" + i, elems.get(i));
+        }
+        return new IrExpr.Record(TUPLE_SENTINEL, members, origin);
+    }
+
+    /** The single element sort of a bare {@code Stream[E]} sort, else null. */
+    private static IrSort streamElementSort(IrSort sort) {
+        if (sort instanceof IrSort.Named n && "Stream".equals(n.name())
+                && n.typeArgs().size() == 1) {
+            return n.typeArgs().get(0);
+        }
+        return null;
+    }
+
+    private IrExpr parsePrimary() throws ParseException {
+        CardinalToken t = peek();
+        // A fragment literal `[(x:T) -> body]` in value position is a lambda — usable as any argument
+        // (e.g. `cell.apply([(x:Int) -> x + 1])`), not only as a `:`-clause ascription.
+        if (looksLikeFragmentLiteral()) {
+            return parseClause();
+        }
+        return switch (t.kind()) {
+            case INTEGER -> {
+                consume();
+                yield new IrExpr.Lit(Long.parseLong(t.text()), t.origin());
+            }
+            case DECIMAL -> {
+                consume();
+                yield new IrExpr.Dec(new java.math.BigDecimal(t.text()), t.origin());
+            }
+            case CHAR -> {
+                consume();
+                yield new IrExpr.Chr(t.text().codePointAt(0), t.origin());
+            }
+            case STRING -> {
+                consume();
+                yield new IrExpr.Str(t.text(), t.origin());
+            }
+            case IDENT -> {
+                if (t.text().equals("true")) {
+                    consume();
+                    yield new IrExpr.Bool(true, t.origin());
+                }
+                if (t.text().equals("false")) {
+                    consume();
+                    yield new IrExpr.Bool(false, t.origin());
+                }
+                if (t.text().equals("match")) {
+                    yield parseMatch();
+                }
+                if (t.text().equals("if")) {
+                    yield parseConditional();
+                }
+                if (t.text().equals("let")) {
+                    yield parseLetExpr();
+                }
+                if (t.text().equals("emit")) {
+                    yield parseEmitStatement();
+                }
+                // Conductor state mutation `this.field = value  cont` — recognized ONLY inside a
+                // conductor handler body. The single `=` (EQUALS, not `==`/EQ) after `this.field`
+                // is the discriminator: `this.count + 1` and `this.count == x` are ordinary reads.
+                if (inConductorHandler && t.text().equals("this")
+                        && peek(1).kind() == CardinalToken.Kind.DOT
+                        && peek(2).kind() == CardinalToken.Kind.IDENT
+                        && peek(3).kind() == CardinalToken.Kind.EQUALS) {
+                    yield parseSelfAssignment();
+                }
+                if (t.text().equals("iter")) {
+                    yield parseIter();
+                }
+                if (KEYWORDS.contains(t.text())) {
+                    throw new ParseException(
+                            "Unexpected keyword '" + t.text() + "' in expression position",
+                            t.origin());
+                }
+                // Just the first ident — parsePrimaryWithPostfix builds the
+                // dotted chain via FieldAccess. Whether the whole chain ends
+                // as a Call (qualified name) or stays as FieldAccess (field
+                // read) is decided when we see (or don't see) a trailing `(`.
+                // Top-level-let access (bare or dotted) is rewritten to a
+                // 0-arg Call at the end of parsePrimaryWithPostfix.
+                CardinalToken nameTok = consume();
+                yield new IrExpr.Var(nameTok.text(), nameTok.origin());
+            }
+            case LPAREN -> {
+                CardinalToken lp = consume();
+                // Value-space cast `(Type:value)` — explicit coercion, the
+                // sibling of the type-space refinement `[Base:pred]`
+                // (docs/dispatch-unification.md → "Coercion"). A complete sort
+                // immediately followed by `:` is unambiguously a cast: in
+                // expression position there is no binder `(name:Type)` (that
+                // lives in declaration slots) and `:` is not an expression
+                // operator, so nothing else can produce a top-level colon here.
+                // The capitalization law fixes the reading before scope matters
+                // — the target is a Type (`[…]` refinement or a Capitalized
+                // name), never a lowercase binder name.
+                IrSort castTarget = tryParseCastTarget();
+                if (castTarget != null) {
+                    IrExpr value = parseExpr();
+                    CardinalToken close = expect(CardinalToken.Kind.RPAREN);
+                    yield new IrExpr.Cast(castTarget, value, lp.spanTo(close));
+                }
+                IrExpr inner = parseExpr();
+                if (peek().kind() == CardinalToken.Kind.COMMA) {
+                    // BRACE-AGGREGATES WAR: paren-tuples are RETIRED. Parens are
+                    // grouping / calls / param lists only; a positional aggregate
+                    // is written with braces `{e0, e1, …}`.
+                    throw new ParseException(
+                            "A parenthesised tuple is no longer a value — use braces: "
+                                    + "`{e0, e1, …}`. Parentheses are for grouping, calls, and "
+                                    + "parameter lists.", peek().origin());
+                }
+                expect(CardinalToken.Kind.RPAREN);
+                yield inner;
+            }
+            case LBRACE -> {
+                // BRACE-AGGREGATES WAR (docs/brace-aggregates.md): braces are
+                // EXCLUSIVELY the aggregate delimiter — positional `{e0, e1, …}`
+                // (including the singleton `{e}` and empty `{}`) and named
+                // `{a = 1, …}` (the dict). The grouping / block role moved to
+                // parens: `( let y = 5  y + 1 )` already binds a let-chain to its
+                // closing `)`, so braces never group. An `IDENT =` head is the
+                // dict (`=` isn't an expression operator, so one token decides).
+                if (peek(1).kind() == CardinalToken.Kind.IDENT
+                        && peek(2).kind() == CardinalToken.Kind.EQUALS) {
+                    yield parseDictLiteral();
+                }
+                // Positional aggregate — the brace-delimited sibling of the paren
+                // tuple, lowering to the SAME `_tuple` Record (no new IR node).
+                // `{}` is empty, `{e}` a singleton, `{e0, e1, …}` n-ary.
+                CardinalToken open = consume();
+                List<IrExpr> elems = new ArrayList<>();
+                if (peek().kind() != CardinalToken.Kind.RBRACE) {
+                    elems.add(parseExpr());
+                    while (peek().kind() == CardinalToken.Kind.COMMA) {
+                        consume();
+                        elems.add(parseExpr());
+                    }
+                }
+                expect(CardinalToken.Kind.RBRACE);
+                yield buildTupleLiteral(elems, open.origin());
+            }
+            case AT -> {
+                // @ is the principal subject — value-under-refinement, or the
+                // scrutinee inside a match arm. At runtime it has no value (it's
+                // a typing-context placeholder), but it lives in the IR as SelfRef.
+                consume();
+                yield new IrExpr.SelfRef(t.origin());
+            }
+            case DOLLAR -> {
+                // Name literal: `$` marks a NAME (the namespace level — quoted,
+                // not evaluated), the third element of the notation law (`[]`
+                // types, `()` values, `$` names). The general production is the
+                // $fqn literal; its one implemented case is the dispatch
+                // reference `$name[Sorts]`, which reifies the dispatch keyed at
+                // those sorts (sort `[Dispatch(...):...]`).
+                CardinalToken dollar = consume();
+                CardinalToken firstName = expect(CardinalToken.Kind.IDENT);
+                StringBuilder name = new StringBuilder(firstName.text());
+                CardinalToken lastName = firstName;
+                while (peek().kind() == CardinalToken.Kind.DOT
+                        && peek(1).kind() == CardinalToken.Kind.IDENT) {
+                    consume();                       // DOT
+                    CardinalToken seg = consume();        // IDENT
+                    name.append('.').append(seg.text());
+                    lastName = seg;
+                }
+                String dottedName = name.toString();
+                CardinalToken next = peek();
+                boolean adjacentBracket = next.kind() == CardinalToken.Kind.LBRACKET
+                        && next.line() == lastName.line()
+                        && next.column() == lastName.column() + lastName.text().length();
+                if (adjacentBracket) {
+                    consume();                       // LBRACKET
+                    List<IrSort> keys = new ArrayList<>();
+                    boolean firstKey = true;
+                    while (peek().kind() != CardinalToken.Kind.RBRACKET) {
+                        if (!firstKey) expect(CardinalToken.Kind.COMMA);
+                        keys.add(parseSort());
+                        firstKey = false;
+                    }
+                    CardinalToken close = expect(CardinalToken.Kind.RBRACKET);
+                    yield new IrExpr.DispatchRef(dottedName, keys, dollar.spanTo(close));
+                }
+                throw new ParseException(
+                        "A bare name literal ($" + dottedName + ") is not yet a "
+                                + "value — dispatch references take key sorts "
+                                + "($name[Sorts]); bare type references are a "
+                                + "later slice.",
+                        dollar.origin());
+            }
+            case OP -> {
+                // Unary minus: `-x` ⇒ `0 - x` (cheap desugar).
+                if (t.text().equals("-")) {
+                    consume();
+                    IrExpr operand = parsePrimaryWithPostfix();
+                    yield new IrExpr.BinOp(IrExpr.Op.SUB,
+                            new IrExpr.Lit(0, t.origin()), operand, t.origin());
+                }
+                // Unary not: parsed but the IR has no Not op yet (TODO).
+                if (t.text().equals("!")) {
+                    throw new ParseException(
+                            "Unary '!' is recognized but the IR has no Not op yet — see TODO",
+                            t.origin());
+                }
+                throw new ParseException(
+                        "Unexpected operator '" + t.text() + "' in expression position",
+                        t.origin());
+            }
+            default -> throw new ParseException(
+                    "Unexpected token " + t.kind() + " '" + t.text() + "' in expression position",
+                    t.origin());
+        };
+    }
+}

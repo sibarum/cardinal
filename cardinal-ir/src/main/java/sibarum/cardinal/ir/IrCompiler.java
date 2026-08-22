@@ -1,0 +1,713 @@
+package sibarum.cardinal.ir;
+
+import sibarum.cardinal.core.QualifiedName;
+import sibarum.cardinal.core.symbolic.DispatchTable;
+import sibarum.cardinal.core.symbolic.FunctionDecl;
+import sibarum.cardinal.core.symbolic.Simplifier;
+import sibarum.cardinal.core.symbolic.SymExpr;
+import sibarum.cardinal.core.types.Sort;
+
+import java.util.ArrayList;
+import java.util.IdentityHashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+public final class IrCompiler {
+
+    // Non-final: compile() re-wires it with the module's struct registry so
+    // every consumer of simplifier() (Truffle lowering included) sees the
+    // declared-type names the kernel's claim rule keys on.
+    private Simplifier simplifier;
+
+    public IrCompiler(Simplifier simplifier) {
+        this.simplifier = simplifier;
+    }
+
+    public CompiledModule compile(IrModule module) throws CompileException {
+        // NOTE: trait method expansion (default-body synthesis + return-shell wrapping,
+        // TraitDefaultExpansion) is a CALLER-owned pre-pass — it must run before method
+        // resolution, and shell-wrapping is NOT idempotent, so it runs exactly once per
+        // path: CardinalCompiler.compileModule and IrAstReport both expand before calling
+        // compile(). Do NOT add it here (that would double-wrap the compileModule path).
+
+        // Lower user coercions (`cast Target:(p:Source) -> body`) to 1-param
+        // dispatch functions under the reserved coercion key (Coercions.coerceKey
+        // on the target's base), BEFORE the transform passes — so AliasResolver,
+        // MethodOperatorResolver, the promotions, the gate and registration all see
+        // an ordinary function and resolve its body uniformly. The cast invocation
+        // `(Target:value)` resolves to it via the same key (IrInterpreter.evalCast).
+        module = lowerCoercions(module);
+
+        // Resolve type aliases first — strips IrStmt.TypeAlias declarations and
+        // substitutes every Named reference to an alias with the aliased sort.
+        // After this pass, the rest of the pipeline sees a module with only
+        // function declarations and concrete sorts.
+        IrModule resolved = AliasResolver.resolve(module);
+
+        // Split a struct's intersection is-a base `:[Super & T1 & T2]` into its
+        // single struct super (kept as the base) and its trait obligations (each an
+        // empty `assign trait` impl). Runs right after AliasResolver so base branches
+        // are resolved sorts (Trait vs nominal struct); idempotent on a single base,
+        // so this re-run over an already-lowered module is a no-op (docs/struct-methods.md).
+        resolved = StructTraitLowering.lower(resolved);
+
+        // Concurrent runtime (cut 3c): prove the seated conductors form no emit cycle before compiling them —
+        // a feedback loop across the hive is exactly what cut 3b's drive-to-quiescence cannot terminate. The
+        // first consumer of EmitInterface's statically-extracted emits set (docs/orchestration.md, gap 1).
+        ConductorCycleCheck.check(resolved);
+
+        // The effect gate (the `let`-led preamble, cut 1b): a `let EXPR` discard of a provably effect-free
+        // expression is meaningless — reject it, pointing at `let x = …` / `let _ = …`. The second consumer
+        // of EmitInterface (docs/orchestration.md).
+        EffectGate.check(resolved);
+
+        // Resolve instance-method calls (recv.m(args) → Call("Type.m", [recv,…]))
+        // AND route binary operators to their dispatch overload by operand sort,
+        // in ONE bottom-up walk. Method resolution and operator routing are
+        // mutually dependent — (a+b).m() needs the operator routed first, m(a)+m(b)
+        // needs the methods resolved first — so a single bottom-up pass that types
+        // each node from its already-resolved children satisfies both directions
+        // where a fixed two-pass order could not. Runs after AliasResolver (sorts
+        // alias-free) and before SortChecker. See MethodOperatorResolver.
+        resolved = MethodOperatorResolver.resolve(resolved);
+
+        // Stamp anonymous aggregate literals with the struct name the context
+        // asserts (let annotations, struct-typed params, return positions) —
+        // checked construction with the redundant name elided. Runs BEFORE
+        // DecimalPromotion so a stamped record's Decimal members then get
+        // their literal promotion too.
+        resolved = AggregatePromotion.rewrite(resolved);
+
+        // Promote Int literals to Decimal where the declared sort says Decimal
+        // (struct members, let bindings) — a lossless embedding. Runs here so
+        // both single-file and linked compiles get it.
+        resolved = DecimalPromotion.rewrite(resolved);
+
+        // Implicit Int→Decimal at value boundaries (let/return/args/members) — the
+        // value-level companion to DecimalPromotion's literal rewrite, inserting an
+        // Int→Decimal cast where a non-literal Int meets a declared Decimal. The
+        // closed lossless tower is the only implicit coercion (docs/dispatch-
+        // unification.md → "Coercion"). Runs after the literal promotion (so
+        // literals already read as Decimal) and before the construction gate.
+        resolved = NumericCoercion.rewrite(resolved);
+
+        // The effective-sort lens over the promoted IR (docs/type-records.md, the Inferred record):
+        // span → the accumulated effective sort at each position. Computed here — after the promotions
+        // so it sees promoted members, and BEFORE the construction gate so the gate consumes it rather
+        // than recomputing. Carried onto CompiledModule so it survives compilation (for an IDE later).
+        var effectiveSorts = EffectiveSortLens.of(resolved);
+
+        // The claim rule at construction sites, three-way: provable fit passes
+        // unchecked, provable miss is a compile error, genuine overlap gets a
+        // runtime check stamped on the record (enforced by the interpreter and
+        // the Truffle lowering). Runs after the promotions so it judges the
+        // promoted members.
+        resolved = ConstructionGate.rewrite(resolved, effectiveSorts);
+
+        // Static sort propagation: catch field-access typos and missing-field
+        // references before they reach runtime. Best-effort; the runtime still
+        // validates fields it couldn't resolve here.
+        SortChecker.check(resolved);
+
+        // NOTE (docs/reactive-gui.md): there is deliberately NO "emit must be an Event" guard.
+        // emit accepts ANY value — an event with no consumer is a silent no-op by design (a
+        // consuming application MAY subscribe; if none does, the emit costs nothing), so there is
+        // nothing to reject at compile time. Isolation is achieved by using a distinct type
+        // hierarchy, not by an Event marker. (The former EventEmitCheck pass is retired.)
+
+        // Overload-overlap check: pairwise per function name, reject provable
+        // ambiguity at compile time. Unknown cases (kernel can't decide) pass
+        // through; runtime dispatch ambiguity remains the safety net for those.
+        OverloadOverlap.check(resolved);
+
+        // Nominal struct registry: name → compiled structural Sort, for both the
+        // alias name and the struct's own name (see TypeCatalog.fromModule). Lets the
+        // runtime/dispatch resolve a by-reference struct sort to its shape on
+        // demand — and tells the kernel's claim rule which names are DECLARED
+        // (a name bites iff it's registered). Built before function compilation
+        // and wired into the simplifier so the Truffle path's MatchNodes carry
+        // it too, not just the IrInterpreter path.
+        Map<String, Sort> structRegistry = new LinkedHashMap<>();
+        for (Map.Entry<String, IrSort.Structural> e :
+                sibarum.cardinal.types.TypeCatalog.fromModule(resolved).structShapes().entrySet()) {
+            structRegistry.put(e.getKey(), compileSort(e.getValue()));
+        }
+        this.simplifier = this.simplifier.withRegistry(structRegistry);
+
+        DispatchTable dispatch = new DispatchTable();
+        // Populate the trait/struct/impl relations up front via the shared builder
+        // (the same one SortChecker uses), so both see one transitive relation.
+        TraitRelations.populate(resolved, dispatch.traitRegistry());
+        Map<FunctionDecl, CompiledModule.CompiledFunction> functions = new LinkedHashMap<>();
+        // Eager pre-compilation: every IrSort reachable from the module gets
+        // compiled to a Sort here. Match-branch patterns and other runtime sort
+        // lookups read from this map via CompiledModule.sortFor, so the runtime
+        // path is exception-free.
+        Map<IrSort, Sort> compiledSorts = new IdentityHashMap<>();
+        // Declaration-ordered top-level let names — the engines' force list.
+        List<String> topLevelLets = new ArrayList<>();
+        // Actions (docs/events.md) by the base name of the event type they match. A
+        // `#action#`-keyed FunctionDecl (the parser's lowering, mirroring a coercion) is
+        // compiled as an ordinary function AND recorded here so `emit` can fire it.
+        Map<String, List<CompiledModule.CompiledAction>> actionsByType = new LinkedHashMap<>();
+        // Conduits (docs/reactive-gui.md) arrive as TWO synthetic FunctionDecls sharing a
+        // `seq#NAME` suffix: the fold (`#conduit#…`, params (e,s), return {R,S}) and its init
+        // (`#conduit-init#…`, 0-arg, return S). Collect each leg by that suffix here, then pair
+        // them after the loop into a CompiledConduit keyed by the event type's bare name.
+        Map<String, CompiledModule.CompiledFunction> conduitFolds = new LinkedHashMap<>();
+        Map<String, String> conduitEventKeys = new LinkedHashMap<>();
+        Map<String, CompiledModule.CompiledFunction> conduitInits = new LinkedHashMap<>();
+        // Functions carrying an `assign proof f:Algebraic` claim — mirrors
+        // InferenceContext.fromModule so the runtime tags a metareference's concrete
+        // nominal (AlgebraicDispatch/DispatchBase) the same way the sort stamp does.
+        java.util.Set<String> algebraicFunctions = new java.util.LinkedHashSet<>();
+        // Standing index declarations (docs/stream-queries.md §3) by the bare name of the
+        // element type they key. A `#index#SEQ#KIND#NAME` FunctionDecl (the parser's lowering,
+        // mirroring #action#) is compiled as an ordinary function AND recorded here; a list per
+        // type since several views may key one T differently. Slice B: recorded, drives nothing.
+        Map<String, List<CompiledModule.CompiledIndex>> indexesByType = new LinkedHashMap<>();
+        // Compiled conductors (docs/orchestration.md) — name → its state-seed function, so the
+        // interpreter can seed each conductor's mutable single-owner state cell on first fire.
+        Map<String, CompiledModule.CompiledConductor> conductors = new LinkedHashMap<>();
+
+        // Seating placement rides the `spawn`, not the `conductor` declaration (docs/orchestration.md,
+        // §Seating). The whole program is one combined module here, so a conductor's decl and its spawn
+        // are both in this statement list; pre-scan the spawns so the ConductorDecl arm can stamp each
+        // CompiledConductor with the tier it was seated on (default MAIN_LANE — an unseated decl never
+        // runs, so the default is harmless). A conductor seated more than once is rejected upstream.
+        Map<String, IrStmt.Spawn.Placement> seatedPlacements = new LinkedHashMap<>();
+        for (IrStmt stmt : resolved.statements()) {
+            if (stmt instanceof IrStmt.Spawn sp) seatedPlacements.put(sp.conductorName(), sp.placement());
+        }
+
+        for (IrStmt stmt : resolved.statements()) {
+            switch (stmt) {
+                case IrStmt.FunctionDecl fd -> {
+                    for (IrParam p : fd.params()) registerSort(p.sort(), compiledSorts);
+                    registerSort(fd.returnSort(), compiledSorts);
+                    registerSortsInExpr(fd.body(), compiledSorts);
+                    CompiledModule.CompiledFunction cf =
+                            compileFunctionDecl(fd, dispatch, functions, compiledSorts);
+                    if (fd.topLevelLet()) topLevelLets.add(fd.name());
+                    // An Action: register its (match-sort → reaction) under the event type's
+                    // BARE name. `contains` not `startsWith` — the linker may module-qualify
+                    // the synthetic name ("mod/#action#…"); `#` is non-lexable so this can
+                    // never catch a user function. The bare key matches evalEmit's lookup,
+                    // which normalizes the emitted event's (qualified) type name the same way.
+                    if (fd.name().contains("#action#")) {
+                        IrSort eventSort = fd.params().get(0).sort();
+                        String base = Coercions.baseName(eventSort);
+                        int slash = base == null ? -1 : base.lastIndexOf('/');
+                        String key = slash < 0 ? base : base.substring(slash + 1);
+                        actionsByType
+                                .computeIfAbsent(key, k -> new ArrayList<>())
+                                .add(new CompiledModule.CompiledAction(
+                                        compiledSorts.get(eventSort), cf));
+                    }
+                    // A CONDUCTOR reaction (`…#caction#<Conductor>#SEQ#handler`) — registered like an
+                    // action, but carrying its owning conductor so the interpreter binds that
+                    // conductor's state cell as `this` while the reaction fires (docs/orchestration.md).
+                    // `#caction#` does not contain the substring `#action#`, so the branch above skips it.
+                    if (fd.name().contains("#caction#")) {
+                        IrSort eventSort = fd.params().get(0).sort();
+                        String base = Coercions.baseName(eventSort);
+                        int slash = base == null ? -1 : base.lastIndexOf('/');
+                        String key = slash < 0 ? base : base.substring(slash + 1);
+                        actionsByType
+                                .computeIfAbsent(key, k -> new ArrayList<>())
+                                .add(new CompiledModule.CompiledAction(
+                                        compiledSorts.get(eventSort), cf, conductorOfReactionKey(fd.name())));
+                    }
+                    // A conduit's init leg (`#conduit-init#SEQ#NAME`) — a 0-arg seed function.
+                    // Checked FIRST: "#conduit-init#" does not contain the substring "#conduit#"
+                    // (the marker needs `#conduit` immediately followed by `#`), so the two legs
+                    // never cross-match. Collect by the shared `SEQ#NAME` suffix.
+                    // A standing index (`#index#SEQ#KIND#NAME`): record it under the element
+                    // type's bare name (the single param's sort), recovering KIND and NAME from
+                    // the key. `contains` not `startsWith` — the linker may module-qualify.
+                    if (fd.name().contains("#index#")) {
+                        String suffix = fd.name().substring(
+                                fd.name().indexOf("#index#") + "#index#".length());
+                        String[] parts = suffix.split("#", 3);   // SEQ, KIND, NAME
+                        String kind = parts.length > 1 ? parts[1] : "";
+                        String idxName = parts.length > 2 ? parts[2] : suffix;
+                        IrSort elemSort = fd.params().get(0).sort();
+                        String base = Coercions.baseName(elemSort);
+                        int slash = base == null ? -1 : base.lastIndexOf('/');
+                        String key = slash < 0 ? base : base.substring(slash + 1);
+                        indexesByType
+                                .computeIfAbsent(key, k -> new ArrayList<>())
+                                .add(new CompiledModule.CompiledIndex(idxName, kind, key, cf));
+                    }
+                    if (fd.name().contains("#conduit-init#")) {
+                        String suffix = fd.name().substring(
+                                fd.name().indexOf("#conduit-init#") + "#conduit-init#".length());
+                        conduitInits.put(suffix, cf);
+                    } else if (fd.name().contains("#conduit#")) {
+                        String suffix = fd.name().substring(
+                                fd.name().indexOf("#conduit#") + "#conduit#".length());
+                        // The event type is the first parameter's sort (e:E), keyed by its bare
+                        // name exactly as actions key their match type.
+                        IrSort eventSort = fd.params().get(0).sort();
+                        String base = Coercions.baseName(eventSort);
+                        int slash = base == null ? -1 : base.lastIndexOf('/');
+                        String key = slash < 0 ? base : base.substring(slash + 1);
+                        conduitFolds.put(suffix, cf);
+                        conduitEventKeys.put(suffix, key);
+                    }
+                }
+                case IrStmt.TraitImpl ti -> {
+                    // Register methods as regular FunctionDecls in the
+                    // dispatch table, then add the (typeName, traitName)
+                    // pair to the trait registry so the slice-1 fallback
+                    // rule can resolve trait-method calls at runtime.
+                    for (IrStmt.FunctionDecl m : ti.methods()) {
+                        for (IrParam p : m.params()) registerSort(p.sort(), compiledSorts);
+                        registerSort(m.returnSort(), compiledSorts);
+                        registerSortsInExpr(m.body(), compiledSorts);
+                        compileFunctionDecl(m, dispatch, functions, compiledSorts);
+                    }
+                    // Attribute producers are 0-user-arg projections — compile
+                    // them as dispatch functions too, so `v.attr` (a trait-view
+                    // access) routes to `Type.attr(this)` just like a method.
+                    for (IrStmt.FunctionDecl a : ti.attributeProducers()) {
+                        for (IrParam p : a.params()) registerSort(p.sort(), compiledSorts);
+                        registerSort(a.returnSort(), compiledSorts);
+                        registerSortsInExpr(a.body(), compiledSorts);
+                        compileFunctionDecl(a, dispatch, functions, compiledSorts);
+                    }
+                    // Trait/struct/impl relations are populated once, up front, via
+                    // the shared TraitRelations builder (see below) — not here.
+                }
+                case IrStmt.TypeAlias ta -> {
+                    // AliasResolver keeps trait TypeAliases so SortChecker can find
+                    // contracts; the trait/struct relations they carry are recorded
+                    // up front via TraitRelations, shared with SortChecker.
+                }
+                case IrStmt.Proof p -> {
+                    // proof metadata; not compiled/evaluated — but an `f:Algebraic` claim
+                    // is recorded so the runtime can tag `$f[…]` as AlgebraicDispatch.
+                    if ("Algebraic".equals(proofHeadName(p.proofTree()))) {
+                        algebraicFunctions.add(p.functionName());
+                    }
+                }
+                case IrStmt.ReturnProof rp -> { /* assign-proof metadata; consumed by the return-refinement gate, never compiled or evaluated */ }
+                case IrStmt.Requires r -> { /* import decl; consumed by the module loader/linker + name resolver, not the per-module compile */ }
+                case IrStmt.Exports e -> { /* export decl; consumed by the linker's visibility check */ }
+                case IrStmt.NoOp np -> { /* parser placeholder; no compilation */ }
+                case IrStmt.ConductorDecl cd -> {
+                    // The declaration's handlers are injected+compiled as #caction# reactions by the
+                    // linker/FunctionDecl arm. Here we compile only the STATE SEED: a 0-arg function
+                    // whose body is the record of the state fields at their initializers, so the
+                    // interpreter can seed the conductor's mutable cell (docs/orchestration.md).
+                    Map<String, IrExpr> initMembers = new LinkedHashMap<>();
+                    for (IrStmt.ConductorDecl.StateField f : cd.state()) {
+                        registerSort(f.sort(), compiledSorts);
+                        registerSortsInExpr(f.init(), compiledSorts);
+                        // A Cell[T] field seeds a clocked cell (docs/orchestration.md, §"State is a
+                        // clocked cell"): a `Cell` record with current = next = _init = the initial value.
+                        // Bind the init once (it may be a call) then share it across the slots.
+                        if (f.sort() instanceof IrSort.Named n && "Cell".equals(n.name())) {
+                            String tmp = "#cell-init#" + f.name();
+                            Map<String, IrExpr> cellMembers = new LinkedHashMap<>();
+                            cellMembers.put("current", IrExpr.var(tmp));
+                            cellMembers.put("next", IrExpr.var(tmp));
+                            cellMembers.put("_init", IrExpr.var(tmp));
+                            IrExpr cellSeed = new IrExpr.LetIn(tmp, IrSort.named("_"), f.init(),
+                                    new IrExpr.Record("Cell", cellMembers, cd.origin()), cd.origin());
+                            initMembers.put(f.name(), cellSeed);
+                        } else {
+                            initMembers.put(f.name(), f.init());
+                        }
+                    }
+                    IrSort seedReturn = IrSort.named("_");
+                    registerSort(seedReturn, compiledSorts);   // else compileFunctionDecl gets a null return Sort
+                    IrStmt.FunctionDecl seed = new IrStmt.FunctionDecl(
+                            "#conductor-state#" + cd.name(), List.of(), seedReturn,
+                            new IrExpr.Record(null, initMembers, cd.origin()), cd.origin());
+                    CompiledModule.CompiledFunction seedFn =
+                            compileFunctionDecl(seed, dispatch, functions, compiledSorts);
+                    conductors.put(cd.name(), new CompiledModule.CompiledConductor(cd.name(), seedFn,
+                            seatedPlacements.getOrDefault(cd.name(), IrStmt.Spawn.Placement.MAIN_LANE)));
+                }
+                case IrStmt.Spawn sp -> { /* seating is resolved at link time (reactions already injected); nothing to compile here */ }
+                case IrStmt.Coercion c -> throw new IllegalStateException(
+                        "Coercion must be lowered to a FunctionDecl before the compile loop");
+            }
+        }
+
+        registerSortsInExpr(resolved.main(), compiledSorts);
+
+        // Pair each conduit's fold with its init by their shared `SEQ#NAME` suffix, then key
+        // the CompiledConduit by the event type's bare name. A second conduit for the same
+        // event type is a compile error — a stateful fold is unique per type (the ordered
+        // multi-conduit pipeline is a later step).
+        Map<String, CompiledModule.CompiledConduit> conduitsByType = new LinkedHashMap<>();
+        for (Map.Entry<String, CompiledModule.CompiledFunction> e : conduitFolds.entrySet()) {
+            String suffix = e.getKey();
+            String eventKey = conduitEventKeys.get(suffix);
+            CompiledModule.CompiledFunction init = conduitInits.get(suffix);
+            if (init == null) {
+                throw new IllegalStateException(
+                        "conduit fold '" + suffix + "' has no paired init decl — the parser must "
+                                + "emit both #conduit# and #conduit-init# for one conduit");
+            }
+            if (conduitsByType.containsKey(eventKey)) {
+                throw new CompileException(
+                        "duplicate conduit for event type '" + eventKey + "' — a stateful fold "
+                                + "is unique per type");
+            }
+            conduitsByType.put(eventKey,
+                    new CompiledModule.CompiledConduit(eventKey, e.getValue(), init));
+        }
+
+        return new CompiledModule(
+                resolved.name(), dispatch, functions, resolved.main(), compiledSorts,
+                structRegistry, topLevelLets, actionsByType, algebraicFunctions, effectiveSorts,
+                conduitsByType, indexesByType, conductors);
+    }
+
+    /**
+     * The owning conductor's name from a conductor-reaction key {@code …#caction#<Conductor>#SEQ#handler}
+     * (the parser's encoding). The linker may module-qualify the key ({@code mod/#caction#…}); the
+     * conductor name is the segment immediately after the {@code #caction#} marker.
+     */
+    private static String conductorOfReactionKey(String key) {
+        String marker = "#caction#";
+        int start = key.indexOf(marker) + marker.length();
+        int end = key.indexOf('#', start);
+        return end < 0 ? key.substring(start) : key.substring(start, end);
+    }
+
+    /** The local head-constructor name of a {@code proof} tree ({@code Algebraic}), or null. */
+    private static String proofHeadName(IrExpr tree) {
+        String name = switch (tree) {
+            case IrExpr.Record r -> r.typeName();
+            case IrExpr.Call c -> c.functionName();
+            default -> null;
+        };
+        return name == null ? null : QualifiedName.memberOf(name);
+    }
+
+    /**
+     * Lowers each {@link IrStmt.Coercion} to a 1-param {@link IrStmt.FunctionDecl}
+     * named by {@link Coercions#coerceKey} on the target's base, with the source as
+     * its sole param and the target as its return sort. The shared dispatch engine
+     * then selects the coercion by the runtime value's source sort (most-specific +
+     * refinement matching come free); {@code IrInterpreter.evalCast} looks it up under
+     * the same key. The synthetic name's {@code '#'} prefix can never collide with a
+     * user dispatch key (it is not a lexable identifier/operator). Idempotent on a
+     * module with no coercions.
+     */
+    private static IrModule lowerCoercions(IrModule module) {
+        List<IrStmt> out = new ArrayList<>(module.statements().size());
+        for (IrStmt s : module.statements()) {
+            if (s instanceof IrStmt.Coercion c) {
+                out.add(new IrStmt.FunctionDecl(
+                        Coercions.coerceKey(Coercions.baseName(c.targetSort())),
+                        List.of(new IrParam(c.paramName(), c.sourceSort())),
+                        c.targetSort(), c.body(), c.origin()));
+            } else {
+                out.add(s);
+            }
+        }
+        return new IrModule(module.name(), out, module.main());
+    }
+
+    private CompiledModule.CompiledFunction compileFunctionDecl(
+            IrStmt.FunctionDecl fd,
+            DispatchTable dispatch,
+            Map<FunctionDecl, CompiledModule.CompiledFunction> functions,
+            Map<IrSort, Sort> compiledSorts) throws CompileException {
+        List<FunctionDecl.Param> params = new ArrayList<>();
+        for (IrParam p : fd.params()) {
+            params.add(new FunctionDecl.Param(p.name(), compiledSorts.get(p.sort())));
+        }
+        Sort returnSort = compiledSorts.get(fd.returnSort());
+        FunctionDecl decl = FunctionDecl.declaration(fd.name(), params, returnSort);
+        dispatch.register(decl);
+
+        CompiledModule.CompiledFunction cf =
+                new CompiledModule.CompiledFunction(decl, fd.body(), fd.params());
+        functions.put(decl, cf);
+        return cf;
+    }
+
+    /**
+     * Compiles {@code sort} (and all inner sorts it contains) and stores each
+     * in {@code map} keyed by its {@link IrSort} identity. Idempotent — a sort
+     * already in the map is skipped, which makes it safe to call multiple times
+     * with overlapping subtrees.
+     */
+    private static void registerSort(IrSort sort, Map<IrSort, Sort> map) throws CompileException {
+        if (map.containsKey(sort)) return;
+        Sort compiled = compileSort(sort);
+        map.put(sort, compiled);
+        switch (sort) {
+            case IrSort.Named n -> { /* leaf */ }
+            case IrSort.Refined r -> { /* predicate is SymExpr — not an IrSort */ }
+            case IrSort.Structural s -> {
+                for (IrSort inner : s.members().values()) registerSort(inner, map);
+            }
+            case IrSort.CallSig c -> {
+                for (IrSort p : c.paramSorts()) registerSort(p, map);
+                registerSort(c.returnSort(), map);
+            }
+            case IrSort.Trait t -> {
+                // Contract member sorts are call-sig sorts; recurse into each.
+                for (IrSort.CallSig f : t.methods().values()) registerSort(f, map);
+                // Attribute requirement sorts (e.g. [Int:@>0]) bite too.
+                for (IrSort a : t.attributes().values()) registerSort(a, map);
+            }
+            case IrSort.Union u -> {
+                for (IrSort b : u.branches()) registerSort(b, map);
+            }
+            case IrSort.Intersection i -> {
+                for (IrSort b : i.branches()) registerSort(b, map);
+            }
+        }
+    }
+
+    /**
+     * Walks an IrExpr tree and registers every {@link IrSort} referenced
+     * (let-binding sorts, lambda param/return sorts, match-branch patterns).
+     */
+    private static void registerSortsInExpr(IrExpr expr, Map<IrSort, Sort> map) throws CompileException {
+        switch (expr) {
+            case IrExpr.Lit l -> { }
+            case IrExpr.Dec d -> { }
+            case IrExpr.Chr c -> { }
+            case IrExpr.Str s -> { }
+            case IrExpr.Bool b -> { }
+            case IrExpr.Var v -> { }
+            case IrExpr.SelfRef s -> { }
+            case IrExpr.DispatchRef d -> {
+                for (IrSort k : d.keySorts()) registerSort(k, map);
+            }
+            case IrExpr.BinOp op -> {
+                registerSortsInExpr(op.left(), map);
+                registerSortsInExpr(op.right(), map);
+            }
+            case IrExpr.LetIn l -> {
+                registerSort(l.declaredSort(), map);
+                // Binding claims kept by the gate are runtime-checked via
+                // CompiledModule.sortFor — register them like record checks.
+                if (l.claim() != null) registerSort(l.claim(), map);
+                registerSortsInExpr(l.value(), map);
+                registerSortsInExpr(l.body(), map);
+            }
+            case IrExpr.Call c -> {
+                for (IrExpr arg : c.args()) registerSortsInExpr(arg, map);
+            }
+            case IrExpr.Lambda lam -> {
+                for (IrParam p : lam.params()) registerSort(p.sort(), map);
+                registerSort(lam.returnSort(), map);
+                registerSortsInExpr(lam.body(), map);
+            }
+            case IrExpr.Apply app -> {
+                registerSortsInExpr(app.fn(), map);
+                for (IrExpr arg : app.args()) registerSortsInExpr(arg, map);
+            }
+            case IrExpr.Match m -> {
+                registerSortsInExpr(m.scrutinee(), map);
+                for (IrExpr.MatchBranch b : m.branches()) {
+                    registerSort(b.pattern(), map);
+                    registerSortsInExpr(b.result(), map);
+                }
+            }
+            case IrExpr.Record r -> {
+                // Stamped construction checks read their sorts at runtime via
+                // CompiledModule.sortFor — register them like match patterns.
+                for (IrSort s : r.runtimeChecks().values()) registerSort(s, map);
+                for (IrExpr v : r.members().values()) registerSortsInExpr(v, map);
+            }
+            case IrExpr.FieldAccess fa -> registerSortsInExpr(fa.base(), map);
+            case IrExpr.MethodCall mc -> throw MethodResolver.unresolved(mc, "IrCompiler");
+            case IrExpr.Iterate it -> {
+                // Register the source, accumulator inits, arm patterns (the
+                // interpreter resolves them via CompiledModule.sortFor), and the
+                // write values' sorts.
+                registerSortsInExpr(it.source(), map);
+                for (IrExpr cs : it.coSources()) registerSortsInExpr(cs, map);  // zip lockstep sources
+                for (IrExpr.OutputSpec os : it.outputs()) {
+                    if (os.init() != null) registerSortsInExpr(os.init(), map);
+                }
+                for (IrExpr.Arm arm : it.arms()) {
+                    registerSort(arm.pattern(), map);
+                    for (IrExpr.Write w : arm.writes()) {
+                        if (w.key() != null) registerSortsInExpr(w.key(), map);
+                        registerSortsInExpr(w.value(), map);
+                    }
+                }
+            }
+            case IrExpr.Cast cast -> {
+                registerSort(cast.targetSort(), map);
+                registerSortsInExpr(cast.value(), map);
+            }
+            case IrExpr.Emit em -> {
+                registerSortsInExpr(em.event(), map);
+                registerSortsInExpr(em.body(), map);
+            }
+        }
+    }
+
+    public static Sort compileSort(IrSort sort) throws CompileException {
+        return switch (sort) {
+            case IrSort.Named n -> Sort.of(n.name());
+            case IrSort.Refined r -> Sort.refined(r.name(), compileSymExpr(r.predicate()));
+            case IrSort.Structural s -> {
+                java.util.Map<String, Sort> members = new java.util.LinkedHashMap<>();
+                for (java.util.Map.Entry<String, IrSort> e : s.members().entrySet()) {
+                    members.put(e.getKey(), compileSort(e.getValue()));
+                }
+                yield Sort.structural(s.name(), members);
+            }
+            case IrSort.CallSig c -> {
+                // The call-kind capability decides which core-Sort shape to build:
+                // a function-style head (Method, the builtin) → a function sort
+                // (satisfied by a lambda, full function subtyping); any other callable
+                // head → a dispatch sort (satisfied by a metareference, exact keys).
+                // Only Method is function-style, so everything else defaults to
+                // dispatch — no name-branch logic, just the seeded capability
+                // (docs/dispatch-method-elimination.md §2).
+                java.util.List<Sort> params = new java.util.ArrayList<>(c.paramSorts().size());
+                for (IrSort p : c.paramSorts()) {
+                    params.add(compileSort(p));
+                }
+                Sort ret = compileSort(c.returnSort());
+                yield CallKinds.builtin(c.typeName()) == CallKinds.Kind.FUNCTION
+                        ? Sort.method(params, ret)
+                        : Sort.dispatch(params, ret);
+            }
+            case IrSort.Trait t -> {
+                // At the Sort layer, a trait collapses to a bare named sort.
+                // The runtime trait-fallback rule looks up the name in the
+                // TraitRegistry to find satisfying concrete types — the
+                // method contract itself is only needed at compile time for
+                // SortChecker validation, not at runtime.
+                // Applied type args are carried so a parametric contract (Stream's
+                // element type) can be checked at runtime — WAR(stream) §8.6.
+                if (t.typeArgs().isEmpty()) {
+                    yield Sort.of(t.name());
+                }
+                List<Sort> args = new ArrayList<>(t.typeArgs().size());
+                for (IrSort a : t.typeArgs()) args.add(compileSort(a));
+                yield Sort.of(t.name(), args);
+            }
+            case IrSort.Union u -> {
+                java.util.List<Sort> branches = new java.util.ArrayList<>(u.branches().size());
+                for (IrSort b : u.branches()) branches.add(compileSort(b));
+                yield Sort.union(branches);
+            }
+            case IrSort.Intersection i -> {
+                java.util.List<Sort> branches = new java.util.ArrayList<>(i.branches().size());
+                for (IrSort b : i.branches()) branches.add(compileSort(b));
+                yield Sort.intersection(branches);
+            }
+        };
+    }
+
+    public static SymExpr compileSymExpr(IrExpr expr) throws CompileException {
+        return switch (expr) {
+            case IrExpr.Lit l -> SymExpr.lit(l.value());
+            // Decimal literals appear in Decimal narrows ([Decimal:@>=1.5]);
+            // SortChecker's shape validation governs where they're allowed.
+            case IrExpr.Dec d -> SymExpr.dec(d.value());
+            case IrExpr.Chr c -> SymExpr.chr(c.codePoint());
+            case IrExpr.Str s -> SymExpr.str(s.value());
+            case IrExpr.DispatchRef d -> {
+                List<Sort> keys = new ArrayList<>(d.keySorts().size());
+                for (IrSort k : d.keySorts()) keys.add(compileSort(k));
+                yield new SymExpr.DispatchRef(d.functionName(), keys);
+            }
+            case IrExpr.Bool b -> SymExpr.bool(b.value());
+            case IrExpr.Var v -> SymExpr.var(v.name());
+            case IrExpr.SelfRef s -> SymExpr.self();
+            case IrExpr.BinOp op -> compileBinOp(op);
+            case IrExpr.LetIn l -> {
+                // LetIn in a refinement predicate context: rare. Encode as
+                // App(Lam(name, body), value) so substitution machinery handles it.
+                yield SymExpr.app(
+                        SymExpr.lam(l.name(), compileSymExpr(l.body())),
+                        compileSymExpr(l.value()));
+            }
+            case IrExpr.Call c -> {
+                // Multi-arg call lifted as a left-fold of App over Var(functionName).
+                // Simplifier rules can pattern-match App-chains rooted at a named Var
+                // and reduce them against the dispatch table when arguments are concrete.
+                SymExpr fn = SymExpr.var(c.functionName());
+                for (IrExpr arg : c.args()) {
+                    fn = SymExpr.app(fn, compileSymExpr(arg));
+                }
+                yield fn;
+            }
+            case IrExpr.Lambda lambda -> throw new CompileException(
+                    "Lambdas inside refinement predicates are not yet supported",
+                    lambda.origin());
+            case IrExpr.Apply apply -> throw new CompileException(
+                    "Function applications inside refinement predicates are not yet supported",
+                    apply.origin());
+            case IrExpr.Match match -> throw new CompileException(
+                    "Match expressions inside refinement predicates are not yet supported",
+                    match.origin());
+            case IrExpr.Record r -> {
+                java.util.Map<String, SymExpr> members = new java.util.LinkedHashMap<>();
+                for (java.util.Map.Entry<String, IrExpr> e : r.members().entrySet()) {
+                    members.put(e.getKey(), compileSymExpr(e.getValue()));
+                }
+                yield SymExpr.record(r.typeName(), members);
+            }
+            case IrExpr.FieldAccess fa -> SymExpr.fieldAccess(compileSymExpr(fa.base()), fa.fieldName());
+            case IrExpr.MethodCall mc -> throw MethodResolver.unresolved(mc, "IrCompiler");
+            // An iteration is a stream/tuple value, not a predicate term — it can
+            // never legitimately appear inside a refinement predicate, so the
+            // linear kernel rejects it here. The receipt Drafter hoists every
+            // iteration out to a step Node *before* compileSymExpr sees the body
+            // (Drafter.hoistCalls), so this throw fences predicate-position misuse
+            // only, never the well-formed fold (docs/iteration.md §5).
+            case IrExpr.Iterate it -> throw new CompileException(
+                    "Iteration inside refinement predicates is not supported", it.origin());
+            // A cast is a runtime coercion value, not a predicate term — the
+            // linear refinement kernel has no encoding for it.
+            case IrExpr.Cast cast -> throw new CompileException(
+                    "Casts inside refinement predicates are not supported", cast.origin());
+            // An emit is a write-only statement, never a predicate term.
+            case IrExpr.Emit em -> throw new CompileException(
+                    "emit inside refinement predicates is not supported", em.origin());
+        };
+    }
+
+    private static SymExpr compileBinOp(IrExpr.BinOp op) throws CompileException {
+        SymExpr l = compileSymExpr(op.left());
+        SymExpr r = compileSymExpr(op.right());
+        return switch (op.op()) {
+            case ADD -> SymExpr.add(l, r);
+            case MUL -> SymExpr.mul(l, r);
+            case SUB -> SymExpr.add(l, SymExpr.mul(SymExpr.lit(-1), r));
+            // Division/remainder are not in the linear integer fragment the
+            // refinement kernel reasons over — reject in predicate position.
+            case DIV, MOD, POW -> throw new CompileException(
+                    "Division/remainder/power ('/', '%', '^') is not supported inside "
+                            + "refinement predicates — the discharge kernel is linear.", op.origin());
+            // Approximate equality is a runtime value operator; the proof layer
+            // never forgives — predicates and narrows stay exact.
+            case APPROX -> throw new CompileException(
+                    "'~=' is not allowed inside refinement predicates — sorts use exact "
+                            + "equality; approximate equality is a runtime value operator.",
+                    op.origin());
+            case LT -> SymExpr.cmp(l, SymExpr.CmpOp.LT, r);
+            case LE -> SymExpr.cmp(l, SymExpr.CmpOp.LE, r);
+            case GT -> SymExpr.cmp(l, SymExpr.CmpOp.GT, r);
+            case GE -> SymExpr.cmp(l, SymExpr.CmpOp.GE, r);
+            case EQ -> SymExpr.cmp(l, SymExpr.CmpOp.EQ, r);
+            case NE -> SymExpr.cmp(l, SymExpr.CmpOp.NE, r);
+            case AND -> SymExpr.and(l, r);
+            case OR -> SymExpr.or(l, r);
+        };
+    }
+
+    public Simplifier simplifier() {
+        return simplifier;
+    }
+}

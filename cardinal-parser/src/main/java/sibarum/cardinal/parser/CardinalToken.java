@@ -1,0 +1,51 @@
+package sibarum.cardinal.parser;
+
+import sibarum.cardinal.core.Origin;
+
+/**
+ * Token type for {@link CardinalLexer} / {@link CardinalParser} — the Cardinal syntax
+ * frontend described in {@code docs/language-reference.ptf}. Distinct from
+ * the S-expression {@link SexprToken} because the Cardinal syntax tokenizes operator
+ * characters as their own tokens (so {@code Int>0} splits into three).
+ */
+public record CardinalToken(Kind kind, String text, String source, int line, int column) {
+
+    public enum Kind {
+        // Atoms
+        INTEGER,    // 42, -3
+        DECIMAL,    // 3.14, -0.5 — BigDecimal literals (digits '.' digits)
+        CHAR,       // 'a', '\n' — text is the RESOLVED character (escapes decoded)
+        STRING,     // "abc", "\n" — text is the RESOLVED content (escapes decoded); first Char collection
+        REGEX,      // `\d+` — a RAW regex literal; text is the verbatim regex source (backslashes NOT decoded), only \` un-escaped to `
+        IDENT,      // foo, Point, factorial — keywords are recognized at parse time
+
+        // Brackets
+        LPAREN, RPAREN,         // ( )
+        LBRACKET, RBRACKET,     // [ ]
+        LBRACE, RBRACE,         // { }
+
+        // Punctuation
+        COMMA,                  // ,
+        COLON,                  // :
+        SEMICOLON,              // ; — the optional definition/member terminator (end-this-definition-early)
+        DOT,                    // .
+        AT,                     // @
+        DOLLAR,                 // $ — name-literal sigil ($fqn; metareferences)
+        EQUALS,                 // = (value-level assignment; used by parseLet and by-name struct literals)
+        ARROW,                  // ->
+
+        // Operators (text carries the specific operator: +, -, *, /, <, <=, >, >=, ==, !=, &, |, !)
+        // `|` here means logical/union OR, `&` means logical/intersection AND, `!` means NOT.
+        OP,
+
+        EOF
+    }
+
+    public Origin origin() {
+        return Origin.at(source, line, column);
+    }
+
+    public Origin spanTo(CardinalToken end) {
+        return Origin.span(source, line, column, end.line, end.column + end.text.length());
+    }
+}

@@ -1,0 +1,94 @@
+package sibarum.cardinal.core.types;
+
+import sibarum.cardinal.core.Origin;
+import sibarum.cardinal.core.symbolic.RuntimeCheckException;
+
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.Objects;
+
+public final class RecordValue {
+
+    private final String typeName;
+    private final Map<String, Object> members;
+
+    public RecordValue(Map<String, Object> members) {
+        this(null, members);
+    }
+
+    /**
+     * @param typeName the nominal struct type name (e.g., {@code "Point"}),
+     *                 or {@code null} for anonymous records. Used downstream
+     *                 by the dispatch table's trait-fallback rule to identify
+     *                 the concrete type of an argument.
+     */
+    public RecordValue(String typeName, Map<String, Object> members) {
+        if (members == null) {
+            throw new IllegalArgumentException("RecordValue members must be non-null");
+        }
+        this.typeName = typeName;
+        this.members = Collections.unmodifiableMap(new LinkedHashMap<>(members));
+    }
+
+    public String typeName() {
+        return typeName;
+    }
+
+    public Map<String, Object> members() {
+        return members;
+    }
+
+    public Object get(String fieldName, Origin accessOrigin) {
+        if (!members.containsKey(fieldName)) {
+            throw new RuntimeCheckException(
+                    "Record has no field '" + fieldName + "'; available fields: " + members.keySet(),
+                    accessOrigin);
+        }
+        return members.get(fieldName);
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        // Equality follows matching ("if it wouldn't match, it's not equal"):
+        // the claim is part of the value, so Point{x:1} != {x:1} and two
+        // same-shape differently-named structs are unequal. Anonymous values
+        // (null typeName) compare by content. Native equality only — user
+        // `==` overloads are ordinary dispatch and never consult this.
+        return o instanceof RecordValue r
+                && Objects.equals(typeName, r.typeName)
+                && members.equals(r.members);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(typeName, members);
+    }
+
+    @Override
+    public String toString() {
+        // Tuples (the "_tuple" sentinel) are anonymous positional aggregates —
+        // render `{1, true}` from their _0.._n members rather than
+        // `_tuple{_0: 1, _1: true}`. BRACE-AGGREGATES WAR: aggregates print in
+        // braces (positional `{1, true}`, named `{a: 1}`); parens are grouping.
+        boolean tuple = "_tuple".equals(typeName);
+        StringBuilder sb = new StringBuilder();
+        if (typeName != null && !tuple) sb.append(typeName);
+        sb.append("{");
+        boolean first = true;
+        for (Map.Entry<String, Object> e : members.entrySet()) {
+            if (!first) sb.append(", ");
+            Object v = e.getValue();
+            String rendered = v instanceof java.math.BigDecimal d
+                    ? sibarum.cardinal.core.Decimals.display(d)
+                    : String.valueOf(v);
+            if (tuple) {
+                sb.append(rendered);
+            } else {
+                sb.append(e.getKey()).append(": ").append(rendered);
+            }
+            first = false;
+        }
+        return sb.append("}").toString();
+    }
+}
