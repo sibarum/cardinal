@@ -1,0 +1,17 @@
+Cardinal
+Copyright 2026 James Watkins
+
+This product includes software forked from the Pontif Framework:
+
+  Pontif Framework
+  Copyright 2026 James Watkins and the Pontif contributors
+  Licensed under the Apache License, Version 2.0
+
+Cardinal takes the Pontif parser, IR, type inference, predicate engine and
+notary (the conservation and receipts modules), and omits the Truffle-based
+runtime: the pontif-ast and pontif-runtime modules, the builtin libraries and
+the CLI. The IR is retained as a service descriptor rather than as an input to
+execution.
+
+Source code is licensed under the Apache License, Version 2.0. See LICENSE for
+the full text.
