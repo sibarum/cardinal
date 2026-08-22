@@ -93,21 +93,68 @@ So the isomorphism is the work, not a repackaging of something already present.
 That is worth knowing before starting: the fork is mechanical, and the actual
 build is the descriptor and its inverse.
 
-## Fork, or a module upstream?
+## Coexistence
 
-Worth deciding rather than assuming, because the two-front-ends finding changes
-the calculus.
+Cardinal and Pontif must be able to sit in one runtime without conflicting. That
+assumption is load-bearing — a service that speaks descriptors while a Pontif
+program executes alongside it is the point — so it is worth stating what it
+actually requires. Checked against the live tree:
 
-Since a front end over the IR is already a supported shape, and no serialisation
-exists, most of what Cardinal wants could be **a module inside Pontif** — an
-IR ↔ descriptor pair with no Truffle in it, sitting alongside the two existing
-front ends. That keeps one tree and 647 commits of upstream work flowing in.
+| what could collide | state upstream | what Cardinal must do |
+| --- | --- | --- |
+| Java packages | everything is `sibarum.pontif.*` (316 files) | rename to `sibarum.cardinal.*` |
+| Maven coordinates | `sibarum.pontif:pontif-framework` | own groupId and artifactIds |
+| JPMS module names | no `module-info.java` anywhere | nothing |
+| Truffle language id | `@TruffleLanguage.Registration(id = PontifLanguage.ID)` | nothing — the registration is dropped |
+| `META-INF/services` | only in the builtin and gpu modules | nothing — those are dropped |
 
-What a fork buys that a module cannot: stripping Truffle from `core` and deleting
-the lowering, so the artifact has no execution layer at all and no Truffle on the
-classpath. If the goal is a descriptor library small enough to embed anywhere,
-that matters. If the goal is the descriptor itself, a module gets there sooner and
-without a 40,000-line copy to keep in sync.
+Identical fully-qualified class names on one classpath is the hard conflict: the
+loader picks one and says nothing. The package rename is not cosmetic, it is the
+requirement.
+
+It is also safe to do mechanically. No file in any module Cardinal takes mentions
+its own package in a string literal, `ir` and `core` ship no resources, and the
+only service-loader entries register runtime extensions in modules that are being
+dropped. So the rename is a path-and-declaration transform with nothing hiding
+behind reflection.
+
+And dropping the language registration is what makes coexistence *free* rather
+than negotiated. Cardinal registers no language, claims no id, and answers to no
+file extension. There is nothing for a polyglot context to arbitrate.
+
+### Keep the divergence a transform, not a pile of edits
+
+The benefit worth protecting is being able to take upstream work when it suits
+and ignore it when it does not — and that decays fast if the fork becomes a set
+of hand edits nobody can replay.
+
+So define the fork as a function: **Cardinal = f(Pontif)**, where `f` is rename
+the packages, drop these modules, delete these six files. Keep `f` in the
+repository as a script. Then adopting an upstream change is `f` applied to a
+patch rather than a manual reconciliation, and the fork stays mergeable for as
+long as the transform stays accurate. When `f` stops applying cleanly, that is
+information — it means upstream moved something structural, and it is better to
+learn that from a failing script than from a silent merge.
+
+## Why a fork and not a module upstream
+
+The alternative was real and was considered: since a front end over the IR is
+already a supported shape upstream and no serialisation exists, an IR ↔ descriptor
+module could have lived inside Pontif and kept one tree.
+
+The fork wins on three things a module cannot give:
+
+- **Divergence on purpose.** Cardinal can change the syntax, the type vocabulary
+  or the IR's interface surface when the descriptor calls for it, without owing
+  Pontif a migration.
+- **No shared blast radius.** Neither can break the other. A change here cannot
+  fail a Pontif build, and upstream churn cannot fail a service descriptor.
+- **No execution layer at all.** Truffle comes off `core`, the lowering is
+  deleted, and the artifact is a front end and an IR with nothing underneath it.
+  A module would have carried the runtime's dependencies wherever it went.
+
+The cost is a 40,000-line copy to keep in sync, which is what the transform above
+is for.
 
 ## One syntax, over anything structured
 
