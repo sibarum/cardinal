@@ -5,15 +5,34 @@ the runtime.
 
 Cardinal keeps the syntax, the type inference, the IR and the notary. It drops the
 Truffle execution layer. What is left is a front end that reads a typed,
-pattern-matched, refinement-checked program and produces an IR — and **that IR is
-the service descriptor.**
+pattern-matched, refinement-checked program and produces an IR — and **the IR and
+the service descriptor are isomorphic.**
 
 That is the whole idea. A description of what a service can do is normally a
 second artifact: an OpenAPI document, a `.proto` file, a hand-written table of
 command signatures. It shadows the real types, drifts from them, and is believed
-because nobody checks. If the front end already computed the types and the notary
-already discharged the claims about them, the description is not a shadow of the
-interface — it *is* the interface, with its contracts already proven.
+because nobody checks.
+
+Isomorphic is a stronger and more useful claim than "the IR *is* the descriptor",
+which is only a slogan. It says there is a structure-preserving map both ways: the
+descriptor is the interface in transit rather than a document written about it, and
+anything received can be turned back into a real IR — one the notary can check for
+itself. A consumer is not trusting a description. It is reconstituting a typed
+structure and re-proving the claims locally.
+
+It also buys two things a slogan cannot:
+
+- **Encoding independence.** The descriptor can be JSON, or a typed-header table,
+  or something else later, without the IR caring. The same "written form is the
+  read form" law that governs values, one level up.
+- **A test.** An isomorphism is checkable: serialise, read back, compare. "Is"
+  has nothing to check.
+
+The map is with the IR's *interface surface* — the types, the signatures, the
+discharged claims — not with every field the IR carries. Source spans, internal
+identifiers and anything left over from lowering are not part of it. Defining that
+boundary precisely is a prerequisite, because it is what the isomorphism is an
+isomorphism *with*.
 
 ## Why the runtime comes off cleanly
 
@@ -174,6 +193,11 @@ from an intention into something that fails the build.
 
 Mechanically checkable, and therefore owed a test:
 
+- **the isomorphism**: for every program, the descriptor read back yields an IR
+  whose interface surface is indistinguishable from the original, and the
+  notary reaches the same verdict on both. This is the load-bearing one — it is
+  what licenses a consumer to trust a received descriptor as much as a locally
+  compiled one.
 - any JSON document parses as Cardinal source, to the same value and the same type
 - the written form of a value reads back as that identical value
 - no module outside the fork boundary imports Truffle
@@ -181,6 +205,7 @@ Mechanically checkable, and therefore owed a test:
 
 Judgement, and therefore owed a decision recorded here:
 
+- where the interface surface ends and the IR's private business begins
 - the XML node mapping
 - whether `@` stays
 - which of Pontif's type-level syntax survives contact with JSON's brackets
@@ -191,7 +216,8 @@ Judgement, and therefore owed a decision recorded here:
 several — the filesystem one — rather than the thing being designed. Its typed
 pipes, its command signatures and its three type vocabularies collapse into
 Cardinal's one. `commands`, which currently emits a descriptor written by hand,
-starts emitting the IR.
+starts emitting a projection of the IR — which, if the isomorphism holds, is the
+same information rather than a second copy of it.
 
 ## Licence
 
