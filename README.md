@@ -225,6 +225,6 @@ Cardinal is a fork of the Pontif Framework, Copyright 2026 James Watkins and the
 Pontif contributors, used under the Apache License 2.0. See `LICENSE` and
 `NOTICE`.
 
-Pontif's documentation is CC BY 4.0; this document is original text and does not
-carry that licence, though it summarises Pontif's design and credits it
-throughout.
+Cardinal is dual-licensed the same way Pontif is: source code under Apache-2.0,
+documentation -- including this file -- under CC BY 4.0. See `LICENSE` and
+`LICENSE-docs`.
