@@ -34,40 +34,80 @@ identifiers and anything left over from lowering are not part of it. Defining th
 boundary precisely is a prerequisite, because it is what the isomorphism is an
 isomorphism *with*.
 
-## Why the runtime comes off cleanly
+## Why the execution layer comes off cleanly
 
-The cut is not a guess. Measured against `pontif-framework-2` at the time of the
-fork:
+The strongest evidence is not a measurement: **Pontif already has two front ends
+over one IR.** `PontifParser` reads the surface language and `SexprParser` reads
+an S-expression reference syntax, with `compile` and `compileSexpr` on the same
+compiler. A front end that is not the primary one is a maintained, first-class
+arrangement upstream — so the seam Cardinal wants is deliberate, not inferred.
+
+The measurements agree. Against `pontif-framework` at 647 commits (HEAD
+2026-08-21):
 
 | module | java files | files importing `com.oracle.truffle` |
 | --- | --- | --- |
-| `pontif-parser` | 8 | 0 |
+| `pontif-parser` | 11 | 0 |
 | `pontif-predicates` | 6 | 0 |
 | `pontif-conservation` | 11 | 0 |
-| `pontif-receipts` | 23 | 0 |
-| `pontif-ir` | 62 | 2 |
-| `pontif-core` | 59 | 5 |
-| `pontif-ast` | 31 | **20** (18 of them `VirtualFrame`) |
+| `pontif-receipts` | 24 | 0 |
+| `pontif-runtime` | 32 | 0 |
+| `pontif-ir` | 69 | 2 |
+| `pontif-core` | 60 | 5 |
+| `pontif-ast` | 32 | **21** |
 
-`pontif-ast` *is* the runtime: a tree of nodes with virtual frames. And the
-coupling from the IR to it is two files — `TruffleLowering.java` and
-`TruffleProgram.java` — which are the lowering step itself. Delete the lowering
-and the IR is free standing. The parser, the predicate engine, and both halves of
-the notary already have no Truffle in them at all.
+Note that `pontif-runtime` imports no Truffle at all — the execution coupling
+lives in `pontif-ast`, a tree of nodes with virtual frames. "Stop short of the
+runtime" therefore means, precisely: drop the AST lowering.
 
-So the seam Cardinal cuts along was already in the code. That is a good sign
-about the original factoring, and it is the reason this fork is a weekend of
-mechanical work rather than a rewrite.
+And the coupling from the IR to it is two files, `TruffleLowering.java` and
+`TruffleProgram.java`, which *are* the lowering step. Delete them and the IR
+stands alone. The five in `core` are `Pontif`, `PontifLanguage`, `PontifNode`,
+`PontifRootNode` and `Resolver` — the first four are Truffle language
+registration and drop out with it; `Resolver` is the one that will argue back,
+since it appears to want frame slots for something the rest of the front end
+needs.
 
 **Taken:** `parser`, `ir`, `core`, `predicates`, `conservation`, `receipts`,
-`defaults` — about 35,000 lines.
-**Dropped:** `ast`, `runtime`, `gpu`, the builtin libraries, the CLI.
-**Stripped:** the two lowering files, and the five files in `core` that reach for
-`FrameDescriptor`, `RootNode` or `TruffleLanguage`.
+`defaults` — 183 files, about 40,100 lines.
+**Dropped:** `ast` and `runtime` (64 files, ~6,400 lines), `gpu`, the builtin
+libraries, the CLI, the playground.
+**Stripped:** the two lowering files, and four of the five Truffle files in
+`core`.
 
-This plan rests on module-level dependency and import counts, not on a read of
-the IR or the notary internals. Expect the five `core` files to be the part that
-argues back.
+This plan rests on module-level dependency and import counts plus the
+two-front-ends arrangement, not on a read of the IR or the notary internals.
+
+> Measured against `pontif-framework`. There is a `pontif-framework-2` on the
+> same disk which is 138 commits behind and a month cold; an earlier draft of
+> this document took its numbers from there. Re-check the tree before trusting
+> any figure above.
+
+## What does not exist yet
+
+Nothing in `pontif-ir` serialises the IR. There is no descriptor module, no
+reader, no round-trip. The lowering to Truffle is the only thing that consumes
+the IR structurally.
+
+So the isomorphism is the work, not a repackaging of something already present.
+That is worth knowing before starting: the fork is mechanical, and the actual
+build is the descriptor and its inverse.
+
+## Fork, or a module upstream?
+
+Worth deciding rather than assuming, because the two-front-ends finding changes
+the calculus.
+
+Since a front end over the IR is already a supported shape, and no serialisation
+exists, most of what Cardinal wants could be **a module inside Pontif** — an
+IR ↔ descriptor pair with no Truffle in it, sitting alongside the two existing
+front ends. That keeps one tree and 647 commits of upstream work flowing in.
+
+What a fork buys that a module cannot: stripping Truffle from `core` and deleting
+the lowering, so the artifact has no execution layer at all and no Truffle on the
+classpath. If the goal is a descriptor library small enough to embed anywhere,
+that matters. If the goal is the descriptor itself, a module gets there sooner and
+without a 40,000-line copy to keep in sync.
 
 ## One syntax, over anything structured
 
