@@ -76,10 +76,29 @@ Nothing Cardinal keeps calls them; upstream, only `pontif-demo` does.
 
 **Taken:** `parser`, `ir`, `core`, `predicates`, `conservation`, `receipts`,
 `defaults` — 183 main files (~40,100 lines) plus 67 test files.
-**Dropped:** `ast` and `runtime` (64 files, ~6,400 lines), `gpu`, the builtin
-libraries, the CLI, the playground.
+**Dropped:** `ast` and `runtime`, `gpu`, the builtin libraries, the CLI, the
+playground.
 **Stripped:** nine main files — the two lowering files and the seven above —
 and three Truffle-only test classes.
+**Grafted:** two files out of `runtime`, for the reason below.
+
+### `pontif-runtime` is not the runtime
+
+It is worth being exact about this, because the name misleads and an earlier
+draft of this document was misled by it. `pontif-runtime` imports no Truffle;
+it is the layer that assembles a compiler and drives it — module loading,
+project discovery, the extension mechanism, the report renderers. Its 32 main
+files sit over exactly the seven modules Cardinal takes.
+
+Cardinal does not want the assembly, because it is Pontif's: a standard library
+of extensions, a conductor, an event journal. It builds its own in
+`cardinal-api`. But two of those files are not assembly at all —
+`ModuleLinker` is the cross-module type-checking rule (symbol table, coherence,
+orphan and visibility gates, FQN rewriting) and `NamespaceAssembler` is the
+policy that several sources declaring one module name fold into one. They live
+in `runtime` only because that is where the file loader that calls them lives.
+Without `ModuleLinker`, `requires` does not resolve at all, so keeping the type
+system means keeping it. `f` grafts both into `cardinal-ir`.
 
 > Measured against `pontif-framework`. There is a `pontif-framework-2` on the
 > same disk which is 138 commits behind and a month cold; an earlier draft of
@@ -112,6 +131,12 @@ rather than a disentangling. And the runner design below already needs it —
 "local evaluation is always available, so pushdown is only ever an
 optimisation" is a claim about having a local evaluator, and this is the local
 evaluator. Keeping it is a choice, now a deliberate one.
+
+It is a choice with a boundary, though. `cardinal-api`, the surface an embedder
+integrates against, does not use it and does not expose it: a context parses,
+types and proves, and stops. The interpreter is in the tree because the module
+it lives in came across whole, not because anything Cardinal offers runs
+programs.
 
 ## Coexistence
 
@@ -162,19 +187,27 @@ and ignore it when it does not — and that decays fast if the fork becomes a se
 of hand edits nobody can replay.
 
 So the fork is a function: **Cardinal = f(Pontif)**, where `f` renames the
-packages, drops the modules, deletes the nine files and patches two more. `f`
-lives in the repository as [`tools/fork.sh`](tools/fork.sh). Adopting an
-upstream change is `f` applied to a patch rather than a manual reconciliation,
-and the fork stays mergeable for as long as the transform stays accurate. When
-`f` stops applying cleanly, that is information — it means upstream moved
-something structural, and it is better to learn that from a failing script than
-from a silent merge.
+packages, drops the modules, deletes the nine files, grafts two, and patches
+three. `f` lives in the repository as [`tools/fork.sh`](tools/fork.sh).
+Adopting an upstream change is `f` applied to a patch rather than a manual
+reconciliation, and the fork stays mergeable for as long as the transform stays
+accurate. When `f` stops applying cleanly, that is information — it means
+upstream moved something structural, and it is better to learn that from a
+failing script than from a silent merge.
 
 Which is why `f` fails loudly rather than doing its best. Every file it expects
-to delete must be there, every patch must apply, `cardinal-ir` must still
-depend on the module being dropped and `cardinal-core` on `truffle-api`, and
-the verification at the end is fatal. Each of those is a place where upstream
-could move something structural without the result looking wrong.
+to delete must be there, every graft source must be where it was, every patch
+must apply, `cardinal-ir` must still depend on the module being dropped and
+`cardinal-core` on `truffle-api`, and the verification at the end is fatal.
+Each of those is a place where upstream could move something structural without
+the result looking wrong.
+
+Cardinal's own code lives in modules `f` does not generate. It lists them in
+the reactor and otherwise leaves them alone, and they may depend on the
+generated modules while nothing generated depends on them. There is one so far,
+`cardinal-api`. Keeping that boundary sharp is what stops the transform
+decaying: if hand-written code and generated code shared a module, every
+upstream adoption would be a merge.
 
 ## The fork, as run
 
@@ -185,23 +218,26 @@ tools/fork.sh ../pontif-framework
 Against `pontif-framework` at `fbd3c89` (647 commits), `f` reports:
 
 ```
-f: copied 7 modules
+f: copied 7 modules, grafted 2 files
 f: stripped 12 files
-f: applied 2 patches
+f: applied 3 patches
 f: wrote pom.xml, transformed 7 module poms
-f: ok -- 238 java files (174 main, 64 test), 51345 lines, no Truffle, no pontif
+f: ok -- 240 java files (176 main, 64 test), 51679 lines, no Truffle, no pontif
+f: cardinal-api is Cardinal's own (13 java files), left untouched
 ```
 
 leaving `cardinal-core`, `-predicates`, `-defaults`, `-ir`, `-parser`,
-`-conservation` and `-receipts` under `sibarum.cardinal:cardinal`. Everything
-outside `tools/` is generated by `f`; edit the script, not the tree.
+`-conservation` and `-receipts` under `sibarum.cardinal:cardinal`, with
+`cardinal-api` alongside them as the one hand-written module. Everything else
+outside `tools/` is generated; edit the script, not the tree.
 [`tools/UPSTREAM`](tools/UPSTREAM) records the revision the tree came from, so
 "is the fork current?" has an answer rather than a guess.
 
-`mvn test` is green: **727 tests, no failures.** Upstream's seven modules carry
-779, and the 52 that did not come across are exactly the Truffle execution
+`mvn test` is green: **727 generated tests plus 24 of Cardinal's own, no
+failures.** Upstream's seven modules carry 779, and the 52 that did not come
+across are exactly the Truffle execution
 arms — three test classes deleted outright, and ten `truffle_*` methods removed
-by the two patches from `IrMatchTest` and `IrRecordTest`, which run every case
+by two of the patches, against `IrMatchTest` and `IrRecordTest`, which run every case
 through both engines and assert the two agree. Those two files are patched
 rather than deleted because deleting them to be rid of one arm would have cost
 twenty-nine test methods.
@@ -303,6 +339,12 @@ a backend that has `ST_Distance`, or to stream rows and evaluate it locally.
 Same query text, same answer, different plan. That is the thing every ORM does
 badly.
 
+Injecting symbols is the half a front end can actually do, and it is the half
+that exists: a `Runner` contributes modules of ordinary Cardinal declarations,
+and a program that `requires` one type-checks against it and has its claims
+discharged against it like any other code. Deciding the plan is the runner's
+own business and happens outside Cardinal entirely.
+
 ### Pushdown is a cost model, not a feature
 
 Local evaluation is always available, so pushdown is only ever an optimisation.
@@ -327,6 +369,65 @@ discharges the obligation that a given split preserves meaning. When it cannot,
 the predicate stays local and the query is slower rather than wrong. That is the
 argument for carrying the refinement engine into the fork instead of treating it
 as research overhead.
+
+Half of that is built. A runner's `Capability` declares the symbols it can
+evaluate and whether its semantics are Cardinal's, and a context can be asked
+which runner claims a symbol. **Nothing verifies the declaration** — the
+obligation that a split preserves meaning is not discharged by anything today,
+so `Capability` is a claim a planner may read rather than a proof it may rely
+on. Until that obligation exists, a `FOREIGN` semantics is a standing reason
+not to split a conjunction. Saying so in the type rather than leaving it
+implied is the point of having the type.
+
+## Setting up a context
+
+The embedding surface is `cardinal-api`, Cardinal's own module. A context is a
+configured front end: a language definition, a set of simplifier rules, and the
+runners whose symbols are in scope.
+
+```java
+CardinalContext cardinal = Cardinal.context()
+        .runner(new FilesystemRunner())
+        .build();
+
+switch (cardinal.compile(Source.of("query.cdl", text))) {
+    case Compilation.Checked ok  -> describe(ok.ir(), ok.evidence());
+    case Compilation.Rejected no -> no.diagnostics().forEach(d -> log(d.render()));
+}
+```
+
+Four properties are deliberate.
+
+**Nothing is executed.** A context parses, links, infers types, checks
+refinements and discharges claims; what comes out is a typed IR and the
+notary's evidence for it. There is no `run`, and there is no `IrInterpreter`
+anywhere in `cardinal-api`.
+
+**The notary's work is returned, not just enforced.** Upstream drafts a receipt
+graph, uses it to gate the compile, and throws it away. A checked compilation
+here carries the graph and a verdict per obligation, because that is what a
+consumer re-proves a received descriptor against. Where the notary could not
+reach a verdict at all it says so, in `Evidence.abstentions()`, so an
+abstention is distinguishable from a clean bill.
+
+**Bad input is data; bad setup is an exception.** A program that will not
+compile comes back as `Compilation.Rejected` carrying diagnostics with a phase
+and a position — never a thrown exception, never a string you have to parse. A
+runner contributing source that does not parse, or two runners claiming one
+module name, throws at `build()`, because that is a bug in the embedding rather
+than something a user did.
+
+**Scope belongs to the context, not the process.** Upstream resolves
+`requires` against a process-global registry of compiler-provided modules,
+which means two embeddings with different vocabularies would overwrite one
+another. Here the module universe is a field, so a context with a filesystem
+runner and a context with a SQL runner are alive at the same time, each able to
+compile its own programs and neither able to compile the other's. That is not
+tidiness: it is what the runner design assumes, and the fork's whole coexistence
+argument applied one level in.
+
+Contexts are immutable and safe to share. Building parses every contributed
+module once, so build one and reuse it — that is the expensive part.
 
 ## Seams still open
 
@@ -376,6 +477,10 @@ Already checked, by something that runs:
 - Cardinal and Pontif coexist on one classpath — `tools/coexist.sh`
 - the front end still works after the transform — 727 tests, which is upstream's
   whole suite for these modules bar the Truffle arms
+- two contexts in one JVM have separate scopes: each compiles its own
+  programs and neither can compile the other's — `RunnerScopeTest`
+- a runner's modules are in scope only where required, and an unused runner
+  injects nothing — `RunnerScopeTest`
 
 Judgement, and therefore owed a decision recorded here:
 
@@ -392,6 +497,12 @@ pipes, its command signatures and its three type vocabularies collapse into
 Cardinal's one. `commands`, which currently emits a descriptor written by hand,
 starts emitting a projection of the IR — which, if the isomorphism holds, is the
 same information rather than a second copy of it.
+
+Concretely, that is an implementation of `Runner` contributing a module that
+declares the row shape and the filesystem vocabulary, registered on a context.
+Its index-versus-disk-walk choice is exactly the `Capability` distinction, and
+it is the case that will show whether the declaration is shaped right before
+anything tries to prove things about it.
 
 ## Licence
 

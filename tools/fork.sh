@@ -29,6 +29,28 @@ die() { printf 'fork.sh: %s\n' "$*" >&2; exit 1; }
 # Taken whole: the front end, the IR, and the notary.
 TAKE='core ir parser predicates conservation receipts defaults'
 
+# Cardinal's own, hand-written, never generated. f does not touch these beyond
+# listing them in the reactor and the dependency management. They may depend on
+# the taken modules; nothing taken may depend on them.
+OWN='api'
+
+# Grafted: individual files lifted out of a module Cardinal does not take,
+# because they belong to the front end rather than to the runtime they happen to
+# live in. Each entry is `<source-path>=<destination-module>`; the file's package
+# declaration is rewritten to the destination's, and any resulting same-package
+# import is harmless.
+#
+# ModuleLinker is the cross-module type-checking rule -- symbol table, coherence,
+# orphan and visibility gates, FQN rewriting. It sits in pontif-runtime only
+# because that is where the file loader that calls it lives. Without it `requires`
+# does not resolve at all, so "keep the type system" means taking it.
+# NamespaceAssembler is the sibling policy: several sources declaring one module
+# name fold into one module.
+GRAFT='
+pontif-runtime/src/main/java/sibarum/pontif/runtime/module/ModuleLinker.java=pontif-ir
+pontif-runtime/src/main/java/sibarum/pontif/runtime/module/NamespaceAssembler.java=pontif-ir
+'
+
 # Dropped: pontif-ast is the Truffle execution layer, pontif-runtime and
 # pontif-demo sit on top of it, and gpu / builtin / cli / playground /
 # supirvast are the runtime's surface area. They are simply not copied.
@@ -79,12 +101,24 @@ for m in $TAKE; do
     cp "$SRC/pontif-$m/pom.xml" "$DEST/pontif-$m/pom.xml"
 done
 
+g=0
+for entry in $GRAFT; do
+    src=${entry%=*}
+    into=${entry#*=}
+    [ -f "$SRC/$src" ] || die "graft source missing: $src (upstream moved it?)"
+    dstdir="$DEST/$into/src/main/java/sibarum/pontif/${into#pontif-}"
+    [ -d "$dstdir" ] || die "graft destination missing: $dstdir"
+    sed "1s|^package .*|package sibarum.pontif.${into#pontif-};|" "$SRC/$src" \
+        > "$dstdir/$(basename "$src")"
+    g=$((g + 1))
+done
+
 # Upstream's working tree mixes CRLF and LF file by file. Normalise to LF so
 # that f is deterministic and the patches below cannot fail on line endings;
 # .gitattributes stores LF either way.
 find "$DEST"/pontif-* -type f -exec sed -i 's/\r$//' {} +
 
-say "f: copied 7 modules"
+say "f: copied 7 modules, grafted $g files"
 
 # --- 2. strip the files that reach into Truffle ---------------------------
 
@@ -184,7 +218,7 @@ sed -i 's|<artifactId>cardinal-framework</artifactId>|<artifactId>cardinal</arti
 
     <modules>
 POM
-    for m in $TAKE; do printf '        <module>cardinal-%s</module>\n' "$m"; done
+    for m in $TAKE $OWN; do printf '        <module>cardinal-%s</module>\n' "$m"; done
     cat <<'POM'
     </modules>
 
@@ -220,7 +254,7 @@ POM
                 <scope>test</scope>
             </dependency>
 POM
-    for m in $TAKE; do
+    for m in $TAKE $OWN; do
         printf '            <dependency>\n'
         printf '                <groupId>sibarum.cardinal</groupId>\n'
         printf '                <artifactId>cardinal-%s</artifactId>\n' "$m"
@@ -242,16 +276,34 @@ say "f: wrote pom.xml, transformed 7 module poms"
 # they are properties of the transform rather than of the code.
 
 fail=0
+gen=""
+for m in $TAKE; do gen="$gen $DEST/cardinal-$m"; done
 
-left=$(grep -rl 'com\.oracle\.truffle' "$DEST"/cardinal-*/src "$DEST"/cardinal-*/pom.xml 2>/dev/null || true)
-if [ -n "$left" ]; then
+# No Truffle anywhere, generated or owned -- this is the whole point of the fork.
+left=$(grep -rl 'com\.oracle\.truffle' $gen "$DEST"/cardinal-*/pom.xml 2>/dev/null || true)
+for m in $OWN; do
+    [ -d "$DEST/cardinal-$m/src" ] || continue
+    more=$(grep -rl 'com\.oracle\.truffle' "$DEST/cardinal-$m/src" 2>/dev/null || true)
+    left="$left${more:+
+$more}"
+done
+if [ -n "$(printf '%s' "$left" | tr -d '[:space:]')" ]; then
     say "f: FAIL -- Truffle survives in:"; printf '%s\n' "$left" | sed 's/^/      /'; fail=1
 fi
 
-left=$(grep -ril 'pontif' "$DEST"/cardinal-*/src "$DEST"/cardinal-*/pom.xml 2>/dev/null || true)
+# No 'pontif' in the generated tree. Owned modules are exempt: hand-written
+# Cardinal code is allowed to name its upstream in a comment.
+left=$(grep -ril 'pontif' $gen 2>/dev/null || true)
 if [ -n "$left" ]; then
     say "f: FAIL -- 'pontif' survives in:"; printf '%s\n' "$left" | sed 's/^/      /'; fail=1
 fi
+
+# Owned modules must exist -- the reactor lists them, so a missing one is a
+# build failure with a worse error message than this one.
+for m in $OWN; do
+    [ -f "$DEST/cardinal-$m/pom.xml" ] \
+        || { say "f: FAIL -- owned module cardinal-$m has no pom.xml"; fail=1; }
+done
 
 [ "$fail" -eq 0 ] || die "verification failed"
 
@@ -267,7 +319,11 @@ if [ -d "$SRC/.git" ]; then
     } > "$HERE/UPSTREAM"
 fi
 
-files=$(find "$DEST"/cardinal-*/src -name '*.java' | wc -l | tr -d ' ')
-main=$(find "$DEST"/cardinal-*/src/main -name '*.java' | wc -l | tr -d ' ')
-lines=$(find "$DEST"/cardinal-*/src -name '*.java' -exec cat {} + | wc -l | tr -d ' ')
+files=$(find $gen -name '*.java' | wc -l | tr -d ' ')
+main=$(find $gen -path '*/src/main/*' -name '*.java' | wc -l | tr -d ' ')
+lines=$(find $gen -name '*.java' -exec cat {} + | wc -l | tr -d ' ')
 say "f: ok -- $files java files ($main main, $((files - main)) test), $lines lines, no Truffle, no pontif"
+for m in $OWN; do
+    own=$(find "$DEST/cardinal-$m/src" -name '*.java' 2>/dev/null | wc -l | tr -d ' ')
+    say "f: cardinal-$m is Cardinal's own ($own java files), left untouched"
+done

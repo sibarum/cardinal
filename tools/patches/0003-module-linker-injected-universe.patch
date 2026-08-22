@@ -1,0 +1,73 @@
+ModuleLinker resolves `requires` against a process-global registry of
+compiler-provided builtin modules (BuiltinModules.all(), which lives in the
+runtime module Cardinal does not take). This makes that universe an argument
+instead, so a Cardinal context supplies the modules its runners contribute and
+two contexts with different vocabularies can coexist in one JVM.
+
+The no-argument overloads are kept and delegate with an empty universe, so
+every existing call site behaves as before.
+
+diff --git a/pontif-ir/src/main/java/sibarum/pontif/ir/ModuleLinker.java b/pontif-ir/src/main/java/sibarum/pontif/ir/ModuleLinker.java
+index 44b2477..5683fbc 100644
+--- a/pontif-ir/src/main/java/sibarum/pontif/ir/ModuleLinker.java
++++ b/pontif-ir/src/main/java/sibarum/pontif/ir/ModuleLinker.java
+@@ -54,8 +54,19 @@ public final class ModuleLinker {
+      * disagree about whether a file went through linking.
+      */
+     public static IrModule combineSingle(IrModule parsed) throws CompileException {
++        return combineSingle(parsed, Map.of());
++    }
++
++    /**
++     * {@link #combineSingle(IrModule)} against a supplied module universe --
++     * the modules a Cardinal context makes available to link against, typically
++     * contributed by its runners. Only those a user module actually
++     * {@code requires} are injected.
++     */
++    public static IrModule combineSingle(IrModule parsed, Map<String, IrModule> provided)
++            throws CompileException {
+         return needsLinking(parsed)
+-                ? combine(Map.of(parsed.name(), parsed), parsed.name())
++                ? combine(Map.of(parsed.name(), parsed), parsed.name(), provided)
+                 : parsed;
+     }
+ 
+@@ -109,6 +120,18 @@ public final class ModuleLinker {
+      */
+     public static IrModule combine(Map<String, IrModule> modules, String entryModule)
+             throws CompileException {
++        return combine(modules, entryModule, Map.of());
++    }
++
++    /**
++     * {@link #combine(Map, String)} against a supplied module universe -- the
++     * modules a Cardinal context makes available to link against, typically
++     * contributed by its runners. Upstream this was a process-global registry of
++     * compiler-provided builtins; here it is an argument, so two contexts can
++     * offer different vocabularies in one JVM without colliding.
++     */
++    public static IrModule combine(Map<String, IrModule> modules, String entryModule,
++            Map<String, IrModule> provided) throws CompileException {
+         if (!modules.containsKey(entryModule)) {
+             throw new CompileException(
+                     "Unknown entry module '" + entryModule + "'", Origin.NONE);
+@@ -116,7 +139,7 @@ public final class ModuleLinker {
+         // Seed compiler-provided modules that some user module `requires` — and
+         // only those, so a program that imports none is unaffected (no shadowing
+         // or ambiguity from unused builtins).
+-        Map<String, IrModule> all = withRequiredBuiltins(modules);
++        Map<String, IrModule> all = withRequired(modules, provided);
+         // Seating (docs/orchestration.md, §Seating): a `spawn C` in the ENTRY module activates
+         // conductor C — its body-bearing handler reactions are injected into the entry module's
+         // statements here, BEFORE resolution, so they flow through NameResolver like any other
+@@ -214,8 +237,8 @@ public final class ModuleLinker {
+      * builtin is required, returns {@code modules} unchanged — so non-importing
+      * programs link exactly as before.
+      */
+-    private static Map<String, IrModule> withRequiredBuiltins(Map<String, IrModule> modules) {
+-        Map<String, IrModule> builtins = BuiltinModules.all();
++    private static Map<String, IrModule> withRequired(
++            Map<String, IrModule> modules, Map<String, IrModule> builtins) {
+         // TRANSITIVE collection: a required builtin's own requires pull in
+         // further builtins (std.proof re-exports std.common's Leaf, so
+         // requiring std.proof must inject std.common too).
