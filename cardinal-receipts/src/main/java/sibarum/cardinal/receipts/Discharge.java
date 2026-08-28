@@ -44,8 +44,26 @@ final class Discharge {
                 : IntegerDischarge.discharge(flat, goal);
     }
 
-    /** Splits top-level {@code And}s into separate hypotheses so nested Ors surface. */
+    /**
+     * Splits top-level {@code And}s into separate hypotheses so nested Ors surface, and rewrites a disequality
+     * into the disjunction it is.
+     *
+     * <p>{@code x != c} carries a bound that interval reasoning cannot see, because a single interval cannot
+     * represent a domain with a hole in it. Written as {@code x < c || x > c} the existing case-split above does
+     * the work: each disjunct is contiguous, and one of them is usually vacuous against the other hypotheses.
+     * That is what lets {@code x >= 0 && x != 0} entail {@code x >= 1} over the integers — the shape a negated
+     * {@code if (x == 0)} arrives in, and so the shape every guard clause in a statement language produces.
+     *
+     * <p>Sound in any totally ordered domain, and applied only to hypotheses: negating a <em>goal</em> is the
+     * notary's business and happens before this point.
+     */
     private static void flattenConjunction(SymExpr e, List<SymExpr> out) {
+        if (e instanceof SymExpr.Cmp(SymExpr l, SymExpr.CmpOp op, SymExpr r) && op == SymExpr.CmpOp.NE) {
+            out.add(new SymExpr.Or(
+                    new SymExpr.Cmp(l, SymExpr.CmpOp.LT, r),
+                    new SymExpr.Cmp(l, SymExpr.CmpOp.GT, r)));
+            return;
+        }
         if (e instanceof SymExpr.And(SymExpr l, SymExpr r)) {
             flattenConjunction(l, out);
             flattenConjunction(r, out);
