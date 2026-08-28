@@ -1,8 +1,6 @@
 package sibarum.cardinal.receipts;
 
 import sibarum.cardinal.core.symbolic.SymExpr;
-import sibarum.cardinal.ir.CompileException;
-import sibarum.cardinal.ir.IrModule;
 
 /**
  * Cardinal's built-in receipt-graph verifier. <b>Existence and consent,
@@ -37,13 +35,17 @@ public final class Notary {
     }
 
     /**
-     * Verification 2: {@code graph} agrees with a fresh draft from
-     * {@code source}. Guards against tampered or stale graphs.
+     * Verification 2: {@code graph} agrees with {@code freshDraft}, a graph just drafted from the same source.
+     * Guards against tampered or stale graphs — a drafter is deterministic, so agreement is full structural
+     * equality.
+     *
+     * <p>The notary does not do the re-drafting, and deliberately cannot: which drafter to run depends on what
+     * the source is, and there is more than one source language now. The caller redrafts and hands both graphs
+     * in, which keeps this check — and this class — independent of any drafter's input type. {@link Drafter}
+     * carries the convenience overload for the Pontif-IR case.
      */
-    public static boolean skeletonMatches(ReceiptGraph graph, IrModule source)
-            throws CompileException {
-        ReceiptGraph fresh = Drafter.draft(source);
-        return fresh.equals(graph);
+    public static boolean skeletonMatches(ReceiptGraph graph, ReceiptGraph freshDraft) {
+        return freshDraft != null && freshDraft.equals(graph);
     }
 
     /**

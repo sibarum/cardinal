@@ -228,10 +228,26 @@ f: cardinal-api is Cardinal's own (13 java files), left untouched
 
 leaving `cardinal-core`, `-predicates`, `-defaults`, `-ir`, `-parser`,
 `-conservation` and `-receipts` under `sibarum.cardinal:cardinal`, with
-`cardinal-api` alongside them as the one hand-written module. Everything else
-outside `tools/` is generated; edit the script, not the tree.
-[`tools/UPSTREAM`](tools/UPSTREAM) records the revision the tree came from, so
-"is the fork current?" has an answer rather than a guess.
+`cardinal-api` alongside them as the one module that was hand-written from the
+start. [`tools/UPSTREAM`](tools/UPSTREAM) records the revision the tree came
+from, so "where did this come from?" has an answer rather than a guess.
+
+> **`f` was a bootstrap, not a process.** An earlier version of this section
+> said everything outside `tools/` is generated and told you to edit the script
+> rather than the tree. That is no longer true, and following it now would send
+> you writing patches against files it is simpler to just edit.
+>
+> Cardinal exists so the IR and the proof machinery can be experimented with
+> without steering Pontif from both sides at once — Pontif is the larger
+> project, is not ready for a stable integration, and is harder to move. Keeping
+> the two in sync forever was never the intent. `fork.sh` earned its keep by
+> making the initial extraction and the namespace rewrite reproducible; having
+> done that, **the tree is the source of truth and is edited directly.** The
+> script and `tools/patches/` stay as provenance — how this tree came to exist —
+> not as the route a change has to take.
+>
+> Pontif and Cardinal remain interoperable, in separate namespaces. They are not
+> kept compatible, and neither owes the other an API.
 
 `mvn test` is green: **727 generated tests plus 24 of Cardinal's own, no
 failures.** Upstream's seven modules carry 779, and the 52 that did not come

@@ -64,6 +64,17 @@ public final class Drafter {
 
     private Drafter() {}
 
+    /**
+     * The notary's skeleton check for a graph drafted from Pontif IR: re-draft from {@code source} and compare.
+     *
+     * <p>Lives here rather than on {@link Notary} because it is the only half of that check that has to know what
+     * the source is, and the notary now serves more than one drafter. {@link Notary#skeletonMatches} does the
+     * comparison itself.
+     */
+    public static boolean skeletonMatches(ReceiptGraph graph, IrModule source) throws CompileException {
+        return Notary.skeletonMatches(graph, draft(source));
+    }
+
     /** Drafts a receipt-graph for every {@link IrStmt.FunctionDecl} in the module. */
     public static ReceiptGraph draft(IrModule module) throws CompileException {
         // Module-wide inference context: overloads + declared returns + struct
@@ -188,7 +199,7 @@ public final class Drafter {
                 ? draftMatchBranches(match, resultVar, renameBindings, ctx, callCounter, sink)
                 : List.of(draftUnconditionalBranch(fnBody, resultVar, renameBindings, ctx, callCounter, sink));
 
-        out.add(new Node(fd.name(), params, resultVar, branches));
+        out.add(Node.named(fd.name(), params, resultVar, branches));
         out.addAll(sink.steps());
     }
 
@@ -231,7 +242,7 @@ public final class Drafter {
         SymExpr rhs = transcribeBody(body, renameBindings, ctx, callCounter, calls, sink, receipts);
         receipts.add(new InitialReceipt(
                 SymExpr.cmp(SymExpr.var(resultVar.name()), SymExpr.CmpOp.EQ, rhs)));
-        return new Branch(Optional.empty(), receipts, calls);
+        return Branch.of(Optional.empty(), receipts, calls);
     }
 
     /**
@@ -266,7 +277,7 @@ public final class Drafter {
             SymExpr rhs = transcribeBody(arm.result(), renameBindings, ctx, callCounter, calls, sink, receipts);
             receipts.add(new InitialReceipt(
                     SymExpr.cmp(SymExpr.var(resultVar.name()), SymExpr.CmpOp.EQ, rhs)));
-            branches.add(new Branch(guard, receipts, calls));
+            branches.add(Branch.of(guard, receipts, calls));
         }
         return branches;
     }
@@ -714,9 +725,9 @@ public final class Drafter {
                 receipts.add(new InitialReceipt(
                         SymExpr.cmp(SymExpr.var("r_0"), SymExpr.CmpOp.EQ, rhs)));
             }
-            branches.add(new Branch(guard, receipts, calls));
+            branches.add(Branch.of(guard, receipts, calls));
         }
-        sink.steps().add(new Node(stepName, params, resultVar, branches));
+        sink.steps().add(Node.synthetic(stepName, stepName, params, resultVar, branches));
     }
 
     /**

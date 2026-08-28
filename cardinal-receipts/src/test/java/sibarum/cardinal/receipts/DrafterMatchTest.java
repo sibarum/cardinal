@@ -96,7 +96,7 @@ class DrafterMatchTest {
         // A match-bodied graph still round-trips through skeleton match.
         IrModule module = signModule();
         ReceiptGraph graph = Drafter.draft(module);
-        assertTrue(Notary.skeletonMatches(graph, module));
+        assertTrue(Drafter.skeletonMatches(graph, module));
     }
 
     @Test

@@ -52,7 +52,7 @@ class ReceiptGraphPrinterTest {
                 SymExpr.cmp(SymExpr.self(), SymExpr.CmpOp.GE, SymExpr.lit(1)));
 
         // arm [n_0 == 0]: r_0 == 1
-        Branch base = new Branch(
+        Branch base = Branch.of(
                 Optional.of(SymExpr.cmp(SymExpr.var("n_0"), SymExpr.CmpOp.EQ, SymExpr.lit(0))),
                 List.of(new InitialReceipt(
                         SymExpr.cmp(SymExpr.var("r_0"), SymExpr.CmpOp.EQ, SymExpr.lit(1)))),
@@ -61,7 +61,7 @@ class ReceiptGraphPrinterTest {
         // arm [n_0 > 0]: call factorial(n_0 - 1) -> r_1; r_0 == n_0 * r_1
         SymExpr nMinus1 = SymExpr.add(SymExpr.var("n_0"),
                 SymExpr.mul(SymExpr.lit(-1), SymExpr.lit(1)));
-        Branch recursive = new Branch(
+        Branch recursive = Branch.of(
                 Optional.of(SymExpr.cmp(SymExpr.var("n_0"), SymExpr.CmpOp.GT, SymExpr.lit(0))),
                 List.of(new InitialReceipt(SymExpr.cmp(
                         SymExpr.var("r_0"), SymExpr.CmpOp.EQ,
@@ -70,7 +70,7 @@ class ReceiptGraphPrinterTest {
                         List.of(nMinus1),
                         new Var("r_1", atLeastOne))));
 
-        Node root = new Node("factorial",
+        Node root = Node.named("factorial",
                 List.of(new Param("n_0", nonNeg)),
                 new Var("r_0", atLeastOne),
                 List.of(base, recursive));

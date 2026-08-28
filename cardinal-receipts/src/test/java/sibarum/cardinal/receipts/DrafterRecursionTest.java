@@ -119,7 +119,7 @@ class DrafterRecursionTest {
     void factorial_skeletonMatchRoundTrips() throws Exception {
         IrModule module = factorialModule();
         ReceiptGraph graph = Drafter.draft(module);
-        assertTrue(Notary.skeletonMatches(graph, module),
+        assertTrue(Drafter.skeletonMatches(graph, module),
                 "deterministic re-draft of factorial must equal the original");
     }
 

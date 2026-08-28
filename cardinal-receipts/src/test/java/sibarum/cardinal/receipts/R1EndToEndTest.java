@@ -45,7 +45,7 @@ class R1EndToEndTest {
         assertTrue(Notary.graphExists(graph), "graph should exist");
 
         // 2. Skeleton matches a fresh draft from the same source.
-        assertTrue(Notary.skeletonMatches(graph, module), "skeleton should match a fresh draft");
+        assertTrue(Drafter.skeletonMatches(graph, module), "skeleton should match a fresh draft");
 
         // 3. Default issuer discharges the r_0 >= 0 obligation.
         List<ClosingReceipt> receipts = BuiltinIssuer.close(graph);
@@ -112,7 +112,7 @@ class R1EndToEndTest {
                                 IrExpr.binOp(IrExpr.Op.MUL, IrExpr.var("x"), IrExpr.var("x"))))),
                 IrExpr.lit(0));
 
-        assertFalse(Notary.skeletonMatches(squareGraph, cube),
+        assertFalse(Drafter.skeletonMatches(squareGraph, cube),
                 "graph drafted from x*x must not match a fresh draft of x*x*x");
     }
 
