@@ -109,29 +109,81 @@ public final class BuiltinIssuer {
         List<Node> nodes = graph.roots();
         for (int nodeIndex = 0; nodeIndex < nodes.size(); nodeIndex++) {
             Node node = nodes.get(nodeIndex);
-            Sort resultSort = node.resultVar().sort();
-            if (!resultSort.isRefined()) {
-                continue;  // no obligation to discharge
-            }
-            SymExpr obligation = Substitute.applySelf(
-                    resultSort.predicate(), SymExpr.var(node.resultVar().name()));
-            for (int branchIndex = 0; branchIndex < node.branches().size(); branchIndex++) {
-                Branch branch = node.branches().get(branchIndex);
-                PathFacts facts = PathFacts.of(node, branch);
-                SymExpr goal = facts.substituteDefinition(obligation);
-                boolean engineOk = Discharge.discharge(resultSort, facts.hypotheses(), goal);
-                boolean viaProof = false;
-                if (!engineOk) {
-                    Refinement proof = proofs.get(new GraphReference(nodeIndex, branchIndex));
-                    viaProof = proof != null
-                            && RefinementValidator.validate(node, branch, obligation, proof).verified();
+            for (Obligation obligation : obligationsOf(node)) {
+                for (int branchIndex = 0; branchIndex < node.branches().size(); branchIndex++) {
+                    Branch branch = node.branches().get(branchIndex);
+                    if (!obligation.appliesTo(branch)) {
+                        continue;
+                    }
+                    PathFacts facts = PathFacts.of(node, branch);
+                    SymExpr goal = facts.substituteDefinition(obligation.claim());
+                    boolean engineOk = Discharge.discharge(obligation.domain(), facts.hypotheses(), goal);
+                    boolean viaProof = false;
+                    if (!engineOk) {
+                        Refinement proof = proofs.get(new GraphReference(nodeIndex, branchIndex));
+                        viaProof = proof != null
+                                && RefinementValidator.validate(
+                                        node, branch, obligation.claim(), proof).verified();
+                    }
+                    attempts.add(new Attempt(
+                            nodeIndex, branchIndex, obligation.claim(),
+                            facts.hypotheses(), goal, engineOk || viaProof, viaProof));
                 }
-                attempts.add(new Attempt(
-                        nodeIndex, branchIndex, obligation,
-                        facts.hypotheses(), goal, engineOk || viaProof, viaProof));
             }
         }
         return attempts;
+    }
+
+    /**
+     * One thing to prove about a node's result, the sort whose domain decides how to prove it, and the paths it
+     * applies to ({@code null} meaning all of them).
+     */
+    private record Obligation(SymExpr claim, Sort domain, Branch.Completion completion) {
+        boolean appliesTo(Branch branch) {
+            return completion == null || branch.completion() == completion;
+        }
+    }
+
+    /**
+     * What a node's result sort obliges it to prove.
+     *
+     * <p>A refined sort obliges its predicate on every path, which is the long-standing case and is unchanged.
+     *
+     * <p>A <b>union</b> obliges the conjunction over its refined branches, and each branch's obligation applies
+     * only to the paths that can produce that arm. That is what a result of {@code Int[@>=1] | Throwable} means:
+     * when the method returns normally the result is at least 1, and it may instead throw. A path that throws is
+     * not asked to prove a claim about the value arm, and produces no attempt at all rather than a vacuous one —
+     * there is no obligation there to report on.
+     *
+     * <p>Which paths produce which arm is read from {@link Branch#completion()}, the only thing in the graph that
+     * records it. A {@code RETURN} path produces a value arm. An unrefined arm — {@code Throwable}, normally —
+     * obliges nothing, so it contributes no obligation whichever paths reach it.
+     *
+     * <p>The domain is the <b>arm's</b> sort rather than the union's, so {@code Decimal[@>0] | Throwable} is
+     * discharged densely. Routing on the union's name would read {@code "Decimal | Throwable"}, match nothing,
+     * and fall to the integer engine with its integer-strict cut — sound for the discrete arm and false for a
+     * dense one.
+     */
+    private static List<Obligation> obligationsOf(Node node) {
+        Sort resultSort = node.resultVar().sort();
+        SymExpr resultVar = SymExpr.var(node.resultVar().name());
+
+        if (resultSort.isRefined()) {
+            return List.of(new Obligation(
+                    Substitute.applySelf(resultSort.predicate(), resultVar), resultSort, null));
+        }
+        List<Sort> arms = resultSort.unionBranches();
+        if (arms == null) {
+            return List.of();   // nothing refined, nothing to discharge
+        }
+        List<Obligation> out = new ArrayList<>();
+        for (Sort arm : arms) {
+            if (arm.isRefined()) {
+                out.add(new Obligation(
+                        Substitute.applySelf(arm.predicate(), resultVar), arm, Branch.Completion.RETURN));
+            }
+        }
+        return out;
     }
 
     /**
