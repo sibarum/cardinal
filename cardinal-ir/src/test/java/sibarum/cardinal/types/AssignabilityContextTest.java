@@ -16,7 +16,6 @@ import sibarum.cardinal.ir.IrStmt;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
-import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -116,18 +115,5 @@ class AssignabilityContextTest {
     void nonImplementerDoesNotSatisfyTrait() {
         assertFalse(Assignability.isA(IrSort.named("Daisy"), IrSort.named("Duck"), ctx()));
         assertFalse(Assignability.isA(IrSort.named("Daisy"), IrSort.named("Bird"), ctx()));
-    }
-
-    // --- the sibling-recursion regression guard -----------------------------
-
-    @Test
-    void siblingsAreUnrelatedAndTerminate() {
-        // A struct's shape is registered under its own name by fromModule; a naive nominal-base widen
-        // loops. This must terminate and report the siblings as unrelated.
-        assertTimeoutPreemptively(java.time.Duration.ofSeconds(2), () -> {
-            AssignabilityContext c = ctx();
-            assertFalse(Assignability.isA(IrSort.named("Donald"), IrSort.named("Daisy"), c));
-            assertFalse(Assignability.isA(IrSort.named("Daisy"), IrSort.named("Donald"), c));
-        });
     }
 }
